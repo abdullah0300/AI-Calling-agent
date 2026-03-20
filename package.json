@@ -1,0 +1,14 @@
+{
+  "name": "voiceflow",
+  "private": true,
+  "scripts": {
+    "dev:dashboard": "pnpm --filter dashboard dev",
+    "dev:ws": "pnpm --filter ws-server dev",
+    "dev": "concurrently \"pnpm dev:dashboard\" \"pnpm dev:ws\"",
+    "build:dashboard": "pnpm --filter dashboard build",
+    "build:ws": "pnpm --filter ws-server build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
