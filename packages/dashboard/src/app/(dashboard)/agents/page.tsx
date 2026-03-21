@@ -1,4 +1,4 @@
-import { createClient } from '@/lib/supabase/server'
+import { createAdminClient } from '@/lib/supabase/server'
 import { AgentCard } from '@/components/dashboard/AgentCard'
 import { Button } from '@/components/ui/button'
 import Link from 'next/link'
@@ -7,7 +7,7 @@ import { Plus } from 'lucide-react'
 export const dynamic = 'force-dynamic'
 
 export default async function AgentsPage() {
-  const supabase = await createClient()
+  const supabase = createAdminClient()
 
   const [{ data: agents }, { data: leads }, { data: phoneNumbers }] = await Promise.all([
     supabase.from('agents').select('*').order('created_at', { ascending: false }),

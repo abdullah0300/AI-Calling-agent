@@ -1,11 +1,11 @@
-import { createClient } from '@/lib/supabase/server'
+import { createAdminClient } from '@/lib/supabase/server'
 import { StatsCards } from '@/components/dashboard/StatsCards'
 import { CallsTable } from '@/components/dashboard/CallsTable'
 
 export const dynamic = 'force-dynamic'
 
 export default async function OverviewPage() {
-  const supabase = await createClient()
+  const supabase = createAdminClient()
 
   const today = new Date()
   today.setHours(0, 0, 0, 0)
