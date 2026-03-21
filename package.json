@@ -5,6 +5,9 @@
     "dev:dashboard": "pnpm --filter dashboard dev",
     "dev:ws": "pnpm --filter ws-server dev",
     "dev": "concurrently \"pnpm dev:dashboard\" \"pnpm dev:ws\"",
+
+    "build": "pnpm build:dashboard",
+
     "build:dashboard": "pnpm --filter dashboard build",
     "build:ws": "pnpm --filter ws-server build"
   },
