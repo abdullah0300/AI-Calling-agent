@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
-    "@deepgram/sdk": "latest",
+    "@deepgram/sdk": "^3.0.0",
     "@supabase/supabase-js": "latest",
     "@voiceflow/shared": "workspace:*",
     "express": "^4.19.0",
