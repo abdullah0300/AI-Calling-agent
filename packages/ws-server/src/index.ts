@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import express from 'express'
 import { WebSocketServer, WebSocket } from 'ws'
 import { createServer } from 'http'
