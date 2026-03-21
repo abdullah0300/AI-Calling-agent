@@ -1,8 +1,18 @@
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
 
-const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
-const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! })
+let anthropicClient: Anthropic | null = null
+let openaiClient: OpenAI | null = null
+
+function getAnthropicClient() {
+  if (!anthropicClient) anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
+  return anthropicClient
+}
+
+function getOpenAIClient() {
+  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! })
+  return openaiClient
+}
 
 export interface LLMConfig {
   provider: 'anthropic' | 'openai'
@@ -14,7 +24,7 @@ export interface LLMConfig {
 
 export async function generateAgentResponse(config: LLMConfig): Promise<string> {
   if (config.provider === 'anthropic') {
-    const response = await anthropicClient.messages.create({
+    const response = await getAnthropicClient().messages.create({
       model: config.model,
       max_tokens: 150,
       system: config.systemPrompt,
@@ -27,7 +37,7 @@ export async function generateAgentResponse(config: LLMConfig): Promise<string> 
     return block.type === 'text' ? block.text : ''
   }
 
-  const response = await openaiClient.chat.completions.create({
+  const response = await getOpenAIClient().chat.completions.create({
     model: config.model,
     max_tokens: 150,
     messages: [
