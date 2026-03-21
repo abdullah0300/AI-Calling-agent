@@ -1,0 +1,6 @@
+{
+  "name": "@voiceflow/shared",
+  "version": "1.0.0",
+  "main": "./types/index.ts",
+  "types": "./types/index.ts"
+}

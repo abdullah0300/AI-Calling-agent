@@ -1,0 +1,74 @@
+VoiceFlow — WebCraftio AI Calling Platform (Phase 1)
+=====================================================
+
+A white-label AI voice calling platform for automated outbound sales calls.
+
+ARCHITECTURE
+------------
+Two separate services:
+
+1. packages/dashboard/  — Next.js 15 dashboard (deploy to Vercel free tier)
+   - Dashboard UI (agents, calls, settings)
+   - REST API routes
+   - Telnyx/Twilio webhook receivers
+   - Reads/writes Supabase
+
+2. packages/ws-server/  — WebSocket Audio Server (deploy to Google Cloud Run)
+   - Receives real-time audio from Telnyx
+   - Pipes audio to Deepgram STT
+   - Sends transcript to Claude Haiku
+   - Sends response to ElevenLabs TTS
+   - Sends audio back to Telnyx
+   - Updates Supabase with results
+
+shared/                — Shared TypeScript types
+
+QUICK START
+-----------
+
+1. Set up Supabase:
+   - Create a project at supabase.com
+   - Run supabase/migrations.sql in the SQL Editor
+
+2. Configure environment variables:
+   - Copy packages/dashboard/.env.example to packages/dashboard/.env.local
+   - Copy packages/ws-server/.env.example to packages/ws-server/.env
+   - Fill in all API keys
+
+3. Install dependencies:
+   pnpm install
+
+4. Run both services:
+   pnpm dev
+
+5. Deploy WebSocket server to Google Cloud Run:
+   cd packages/ws-server
+   gcloud run deploy voiceflow-ws-server \
+     --source . --platform managed --region europe-west2 \
+     --allow-unauthenticated --port 4000 \
+     --min-instances 1 --max-instances 10 \
+     --memory 512Mi --cpu 1 --timeout 3600
+
+6. Deploy dashboard to Vercel:
+   cd packages/dashboard
+   npx vercel --prod
+
+PROVIDERS USED
+--------------
+- LLM: Anthropic Claude Haiku (default) / OpenAI GPT
+- STT: Deepgram Nova-3 (default) / Google STT
+- TTS: ElevenLabs Flash v2.5 (default) / Deepgram TTS / Google TTS
+- Telephony: Telnyx (default) / Twilio
+- Database: Supabase (PostgreSQL)
+- Auth: Supabase Auth
+
+COST ESTIMATE
+-------------
+- Vercel dashboard: Free forever
+- Supabase: Free tier forever
+- Google Cloud Run: ~$8/month (covered by $300 credits ~10 months)
+- Deepgram STT: $200 free credits
+- ElevenLabs TTS: $5/month starter
+- Telnyx calls: ~$0.007/min
+- Claude Haiku: ~$0.006/call
+- Total to start: ~$6/month after free tiers
