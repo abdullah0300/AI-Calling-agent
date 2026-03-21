@@ -57,7 +57,7 @@ function createDeepgramStream(config: STTStreamConfig) {
   return {
     sendAudio: (chunk: Buffer) => {
       try {
-        if (connection.getReadyState() === 1) connection.send(chunk)
+        if (connection.getReadyState() === 1) connection.send(chunk as unknown as ArrayBuffer)
       } catch (e) {
         console.error('[STT] Failed to send audio chunk:', e)
       }
