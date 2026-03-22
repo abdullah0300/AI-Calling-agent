@@ -1,3 +1,7 @@
 packages:
-  - 'packages/*'
-  - 'shared'
+  - packages/*
+  - shared
+
+ignoredBuiltDependencies:
+  - sharp
+  - unrs-resolver
