@@ -193,6 +193,10 @@ export async function endSession(callControlId: string, outcome: string) {
   const data = activeSessions.get(callControlId)
   if (!data) return
 
+  // Remove immediately — prevents concurrent calls (stop event + ws.close + hangup webhook)
+  // all firing before the first async endSession completes
+  activeSessions.delete(callControlId)
+
   console.log(`[Pipeline] Ending ${callControlId} — outcome: ${outcome}`)
 
   const { session, sttStream, maxDurationTimer } = data
@@ -221,6 +225,5 @@ export async function endSession(callControlId: string, outcome: string) {
     supabase.from('leads').update({ status: leadStatus }).eq('id', session.leadId),
   ])
 
-  activeSessions.delete(callControlId)
   console.log(`[Pipeline] Session cleaned up: ${callControlId}`)
 }
