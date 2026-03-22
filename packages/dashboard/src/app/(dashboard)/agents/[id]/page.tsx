@@ -23,7 +23,7 @@ const DEFAULT_AGENT: Partial<Agent> = {
   max_call_duration_seconds: 180,
   active_llm: 'anthropic',
   active_llm_model: 'claude-haiku-4-5',
-  active_tts: 'elevenlabs',
+  active_tts: 'deepgram',
   active_stt: 'deepgram',
   active_telephony: 'telnyx',
 }
