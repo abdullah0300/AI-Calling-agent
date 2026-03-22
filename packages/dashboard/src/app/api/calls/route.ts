@@ -56,8 +56,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Could not create call record' }, { status: 500 })
     }
 
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL!
     const wsServerUrl = process.env.WS_SERVER_URL!
+    // WS_PUBLIC_URL is the ngrok/public HTTPS URL of the ws-server
+    // Used so Telnyx (external) can reach the WebSocket and webhook endpoints
+    const wsPublicUrl = process.env.WS_PUBLIC_URL!
 
     // Initiate Telnyx outbound call
     const telnyxRes = await fetch('https://api.telnyx.com/v2/calls', {
@@ -71,11 +73,14 @@ export async function POST(req: NextRequest) {
         to: lead.phone_number,
         from: phoneNumber.number,
         client_state: Buffer.from(JSON.stringify({ callId: callRecord.id })).toString('base64'),
-        webhook_url: `${appUrl}/api/webhook/telnyx`,
+        // Webhook goes to ws-server (same ngrok tunnel as WebSocket)
+        webhook_url: `${wsPublicUrl}/api/webhook/telnyx`,
         webhook_url_method: 'POST',
-        // Stream audio directly to Google Cloud Run WebSocket server
-        stream_url: `${wsServerUrl.replace('https', 'wss')}/audio`,
+        // WSS URL must be publicly reachable by Telnyx — use ngrok public URL
+        stream_url: `${wsPublicUrl.replace('https://', 'wss://')}/audio`,
         stream_track: 'inbound_track',
+        // Required for sending TTS audio back to caller via WebSocket
+        stream_bidirectional_mode: 'mp3',
       }),
     })
 

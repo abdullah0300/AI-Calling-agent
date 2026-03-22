@@ -12,6 +12,7 @@ interface ActiveSession {
   sttStream: ReturnType<typeof createSTTStream> | null
   conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>
   isProcessing: boolean
+  isStarted: boolean
   maxDurationTimer: NodeJS.Timeout | null
 }
 
@@ -20,7 +21,7 @@ export const activeSessions = new Map<string, ActiveSession>()
 export function registerSession(callControlId: string, session: CallSession) {
   activeSessions.set(callControlId, {
     session, ws: null, sttStream: null,
-    conversationHistory: [], isProcessing: false, maxDurationTimer: null,
+    conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -36,6 +37,9 @@ export function attachWebSocket(callControlId: string, ws: WebSocket) {
 export async function startSession(callControlId: string) {
   const data = activeSessions.get(callControlId)
   if (!data) return console.error(`[Pipeline] No session: ${callControlId}`)
+  // Guard against double-start (webhook + WS event could both trigger this)
+  if (data.isStarted) return console.warn(`[Pipeline] Session already started: ${callControlId}`)
+  data.isStarted = true
 
   const { session } = data
 
@@ -170,12 +174,11 @@ async function speakToProspect(callControlId: string, text: string) {
       return
     }
 
-    // Send audio to Telnyx via WebSocket
-    // Telnyx expects this exact JSON structure for media playback
+    // Send TTS audio back to caller via WebSocket (bidirectional mode: mp3)
+    // Telnyx spec: { event: 'media', media: { payload: <base64 mp3> } }
     if (ws && ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
         event: 'media',
-        stream_id: callControlId,
         media: { payload: base64Audio }
       }))
     } else {

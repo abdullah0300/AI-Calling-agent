@@ -26,11 +26,38 @@ app.post('/session/register', (req, res) => {
   res.json({ success: true })
 })
 
-// Called by Next.js dashboard when Telnyx reports call.answered
-app.post('/session/start/:callControlId', async (req, res) => {
-  const { callControlId } = req.params
-  await startSession(callControlId)
-  res.json({ success: true })
+// Telnyx webhook handler — co-located here because ngrok tunnels port 4000 (this server)
+// The dashboard's calls/route.ts sets webhook_url to WS_PUBLIC_URL/api/webhook/telnyx
+app.post('/api/webhook/telnyx', async (req, res) => {
+  const event = req.body?.data?.event_type
+  const payload = req.body?.data?.payload
+
+  console.log('[Telnyx Webhook]', event)
+
+  switch (event) {
+    case 'call.answered':
+      // Session start is triggered by WebSocket 'start' event (after WS is attached)
+      // No action needed here — avoids race condition where WS isn't connected yet
+      break
+
+    case 'call.hangup':
+      // Prospect or agent hung up — end session cleanly
+      if (payload?.call_control_id) {
+        await endSession(payload.call_control_id, payload?.hangup_cause || 'completed')
+          .catch(err => console.error('[Webhook] Failed to end session on hangup:', err))
+      }
+      break
+
+    case 'call.machine.detection.ended':
+      // Answering machine detected — end without speaking
+      if (payload?.result === 'machine' && payload?.call_control_id) {
+        await endSession(payload.call_control_id, 'voicemail')
+          .catch(() => {})
+      }
+      break
+  }
+
+  res.json({ received: true })
 })
 
 const server = createServer(app)
@@ -58,7 +85,12 @@ wss.on('connection', (ws: WebSocket) => {
         case 'start':
           callControlId = message.start?.call_control_id || message.stream_id || null
           console.log(`[WS] Audio stream started: ${callControlId}`)
-          if (callControlId) attachWebSocket(callControlId, ws)
+          if (callControlId) {
+            attachWebSocket(callControlId, ws)
+            // Start session here — AFTER WebSocket is attached — so greeting audio
+            // can be sent immediately. Starting from the webhook risks ws being null.
+            await startSession(callControlId)
+          }
           break
 
         case 'media':
