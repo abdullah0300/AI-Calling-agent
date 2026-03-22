@@ -34,7 +34,15 @@ async function elevenLabsTTS(config: TTSConfig): Promise<string> {
     }
   )
 
-  if (!response.ok) throw new Error(`ElevenLabs failed: ${response.status} ${await response.text()}`)
+  if (!response.ok) {
+    const body = await response.text()
+    // Free plan cannot use library voices — fall back to Deepgram automatically
+    if (response.status === 402) {
+      console.warn('[TTS] ElevenLabs 402: falling back to Deepgram')
+      return deepgramTTS(config)
+    }
+    throw new Error(`ElevenLabs failed: ${response.status} ${body}`)
+  }
   return Buffer.from(await response.arrayBuffer()).toString('base64')
 }
 
