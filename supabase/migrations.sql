@@ -66,10 +66,27 @@ create table public.calls (
   meeting_time timestamptz,
   started_at timestamptz,
   ended_at timestamptz,
-  created_at timestamptz default now()
+  created_at timestamptz default now(),
+  cost_telephony numeric(10,6) default 0,
+  cost_stt numeric(10,6) default 0,
+  cost_tts numeric(10,6) default 0,
+  cost_llm numeric(10,6) default 0,
+  cost_total numeric(10,6) default 0
 );
 -- status: initiated | ringing | in_progress | completed | failed | no_answer
 -- outcome: interested | not_interested | callback | wrong_person | no_answer | voicemail | error
+-- cost columns (all in USD):
+--   cost_telephony: exact amount from Telnyx call.cost webhook
+--   cost_stt: Deepgram Nova-3 streaming @ $0.0077/min
+--   cost_tts: ElevenLabs Flash v2.5 @ $0.30/1K chars, Deepgram Aura @ $0.030/1K chars
+--   cost_llm: Claude Haiku 4.5 @ $1.00/M input + $5.00/M output tokens
+--   cost_total: sum of all above (updated after Telnyx call.cost arrives)
+-- Migration: run the following ALTER statements if table already exists:
+-- ALTER TABLE public.calls ADD COLUMN IF NOT EXISTS cost_telephony numeric(10,6) default 0;
+-- ALTER TABLE public.calls ADD COLUMN IF NOT EXISTS cost_stt numeric(10,6) default 0;
+-- ALTER TABLE public.calls ADD COLUMN IF NOT EXISTS cost_tts numeric(10,6) default 0;
+-- ALTER TABLE public.calls ADD COLUMN IF NOT EXISTS cost_llm numeric(10,6) default 0;
+-- ALTER TABLE public.calls ADD COLUMN IF NOT EXISTS cost_total numeric(10,6) default 0;
 
 -- 6. Settings table
 create table public.settings (

@@ -22,7 +22,20 @@ export interface LLMConfig {
   userMessage: string
 }
 
-export async function generateAgentResponse(config: LLMConfig): Promise<string> {
+export interface LLMResult {
+  text: string
+  costUsd: number
+}
+
+// 2026 rates (source: platform.claude.com/docs/en/about-claude/pricing)
+const ANTHROPIC_INPUT_PER_TOKEN  = 1.00 / 1_000_000   // $1.00 / 1M input tokens  (Haiku 4.5)
+const ANTHROPIC_OUTPUT_PER_TOKEN = 5.00 / 1_000_000   // $5.00 / 1M output tokens (Haiku 4.5)
+
+// 2026 rates (source: platform.openai.com/docs/pricing — GPT-4o-mini)
+const OPENAI_INPUT_PER_TOKEN  = 0.15 / 1_000_000   // $0.15 / 1M input tokens
+const OPENAI_OUTPUT_PER_TOKEN = 0.60 / 1_000_000   // $0.60 / 1M output tokens
+
+export async function generateAgentResponse(config: LLMConfig): Promise<LLMResult> {
   if (config.provider === 'anthropic') {
     const response = await getAnthropicClient().messages.create({
       model: config.model,
@@ -34,7 +47,11 @@ export async function generateAgentResponse(config: LLMConfig): Promise<string> 
       ],
     })
     const block = response.content[0]
-    return block.type === 'text' ? block.text : ''
+    const text = block.type === 'text' ? block.text : ''
+    const inputTokens  = response.usage?.input_tokens  || 0
+    const outputTokens = response.usage?.output_tokens || 0
+    const costUsd = (inputTokens * ANTHROPIC_INPUT_PER_TOKEN) + (outputTokens * ANTHROPIC_OUTPUT_PER_TOKEN)
+    return { text, costUsd }
   }
 
   const response = await getOpenAIClient().chat.completions.create({
@@ -46,5 +63,9 @@ export async function generateAgentResponse(config: LLMConfig): Promise<string> 
       { role: 'user', content: config.userMessage }
     ],
   })
-  return response.choices[0]?.message?.content || ''
+  const text = response.choices[0]?.message?.content || ''
+  const inputTokens  = response.usage?.prompt_tokens     || 0
+  const outputTokens = response.usage?.completion_tokens || 0
+  const costUsd = (inputTokens * OPENAI_INPUT_PER_TOKEN) + (outputTokens * OPENAI_OUTPUT_PER_TOKEN)
+  return { text, costUsd }
 }

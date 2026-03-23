@@ -6,6 +6,10 @@ import { supabase } from '../db/client'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
 import type WebSocket from 'ws'
 
+// Deepgram Nova-3 streaming rate (2026): $0.0077 / min
+// (source: deepgram.com/pricing)
+const DEEPGRAM_STT_PER_BYTE = 0.0077 / 60 / 8000  // $0.0077/min ÷ 60s ÷ 8000 bytes/s (mulaw 8kHz)
+
 interface ActiveSession {
   session: CallSession
   ws: WebSocket | null
@@ -14,6 +18,10 @@ interface ActiveSession {
   isProcessing: boolean
   isStarted: boolean
   maxDurationTimer: NodeJS.Timeout | null
+  // Cost accumulators (USD)
+  costLlm: number
+  costTts: number
+  sttAudioBytes: number  // raw bytes sent to Deepgram — converted to cost at endSession
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -22,6 +30,7 @@ export function registerSession(callControlId: string, session: CallSession) {
   activeSessions.set(callControlId, {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
+    costLlm: 0, costTts: 0, sttAudioBytes: 0,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -72,6 +81,8 @@ export async function startSession(callControlId: string) {
 export async function handleAudioChunk(callControlId: string, audioBuffer: Buffer) {
   const data = activeSessions.get(callControlId)
   if (!data?.sttStream) return
+  // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
+  data.sttAudioBytes += audioBuffer.length
   data.sttStream.sendAudio(audioBuffer)
 }
 
@@ -122,13 +133,16 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
 
       default:
         try {
-          responseText = await generateAgentResponse({
+          const result = await generateAgentResponse({
             provider: session.agent.active_llm,
             model: session.agent.active_llm_model,
             systemPrompt: buildSystemPrompt(session.agent.system_prompt),
             conversationHistory,
             userMessage: transcript,
           })
+          responseText = result.text
+          data.costLlm += result.costUsd
+          console.log(`[Cost] LLM +$${result.costUsd.toFixed(6)} (total LLM: $${data.costLlm.toFixed(6)})`)
         } catch (llmError) {
           console.error(`[Pipeline] LLM error ${callControlId}:`, llmError)
           responseText = "Could you repeat that? I did not quite catch it."
@@ -164,11 +178,13 @@ async function speakToProspect(callControlId: string, text: string) {
   try {
     console.log(`[Pipeline] Agent: "${text}"`)
 
-    let base64Audio: string
+    let ttsResult: { audio: string; costUsd: number }
     try {
-      base64Audio = await textToSpeech({
+      ttsResult = await textToSpeech({
         provider: session.agent.active_tts, text,
       })
+      data.costTts += ttsResult.costUsd
+      console.log(`[Cost] TTS +$${ttsResult.costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
     } catch (ttsError) {
       console.error(`[Pipeline] TTS error ${callControlId}:`, ttsError)
       return
@@ -179,7 +195,7 @@ async function speakToProspect(callControlId: string, text: string) {
     if (ws && ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
         event: 'media',
-        media: { payload: base64Audio }
+        media: { payload: ttsResult.audio }
       }))
     } else {
       console.warn(`[Pipeline] WebSocket not ready: ${callControlId}`)
@@ -208,6 +224,13 @@ export async function endSession(callControlId: string, outcome: string) {
     (Date.now() - new Date(session.startTime).getTime()) / 1000
   )
 
+  // Calculate STT cost from total audio bytes processed
+  const costStt = data.sttAudioBytes * DEEPGRAM_STT_PER_BYTE
+  // cost_telephony will be added later by the call.cost webhook from Telnyx
+  const costTotal = data.costLlm + data.costTts + costStt
+
+  console.log(`[Cost] Call ${callControlId} — LLM: $${data.costLlm.toFixed(6)} | TTS: $${data.costTts.toFixed(6)} | STT: $${costStt.toFixed(6)} | Total (excl. telephony): $${costTotal.toFixed(6)}`)
+
   const leadStatus =
     outcome === 'interested' ? 'interested' :
     outcome === 'not_interested' ? 'not_interested' :
@@ -220,10 +243,33 @@ export async function endSession(callControlId: string, outcome: string) {
       duration_seconds: durationSeconds,
       transcript: session.transcript,
       ended_at: new Date().toISOString(),
+      cost_llm: data.costLlm,
+      cost_tts: data.costTts,
+      cost_stt: costStt,
+      cost_total: costTotal,
     }).eq('id', session.callId),
 
     supabase.from('leads').update({ status: leadStatus }).eq('id', session.leadId),
   ])
 
   console.log(`[Pipeline] Session cleaned up: ${callControlId}`)
+}
+
+// Called from index.ts when Telnyx call.cost webhook arrives
+// Telnyx sends the exact telephony charge after the call ends
+export async function updateTelephonyCost(callControlId: string, costTelephony: number) {
+  const { data: call } = await supabase
+    .from('calls')
+    .select('cost_llm, cost_stt, cost_tts')
+    .eq('telephony_call_id', callControlId)
+    .single()
+
+  if (!call) return
+
+  const costTotal = costTelephony + (call.cost_llm || 0) + (call.cost_stt || 0) + (call.cost_tts || 0)
+  await supabase.from('calls')
+    .update({ cost_telephony: costTelephony, cost_total: costTotal })
+    .eq('telephony_call_id', callControlId)
+
+  console.log(`[Cost] Telnyx telephony: $${costTelephony.toFixed(6)} — Final total: $${costTotal.toFixed(6)}`)
 }

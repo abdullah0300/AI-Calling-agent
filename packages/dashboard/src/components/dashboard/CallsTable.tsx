@@ -47,6 +47,47 @@ function formatDuration(seconds: number | null) {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
+function formatCost(usd: number | null | undefined) {
+  if (usd == null || usd === 0) return '—'
+  return `$${usd.toFixed(4)}`
+}
+
+function CostBreakdown({ call }: { call: CallWithRelations }) {
+  const hasAnyCost = (call.cost_total ?? 0) > 0 ||
+    (call.cost_llm ?? 0) > 0 || (call.cost_tts ?? 0) > 0 ||
+    (call.cost_stt ?? 0) > 0 || (call.cost_telephony ?? 0) > 0
+
+  if (!hasAnyCost) return <span className="text-muted-foreground text-xs">—</span>
+
+  return (
+    <div className="text-xs space-y-0.5 font-mono">
+      {(call.cost_telephony ?? 0) > 0 && (
+        <div className="text-muted-foreground">
+          Tel: <span className="text-foreground">${(call.cost_telephony!).toFixed(4)}</span>
+        </div>
+      )}
+      {(call.cost_stt ?? 0) > 0 && (
+        <div className="text-muted-foreground">
+          STT: <span className="text-foreground">${(call.cost_stt!).toFixed(4)}</span>
+        </div>
+      )}
+      {(call.cost_tts ?? 0) > 0 && (
+        <div className="text-muted-foreground">
+          TTS: <span className="text-foreground">${(call.cost_tts!).toFixed(4)}</span>
+        </div>
+      )}
+      {(call.cost_llm ?? 0) > 0 && (
+        <div className="text-muted-foreground">
+          LLM: <span className="text-foreground">${(call.cost_llm!).toFixed(4)}</span>
+        </div>
+      )}
+      <div className="border-t pt-0.5 font-semibold text-foreground">
+        Total: ${(call.cost_total ?? 0).toFixed(4)}
+      </div>
+    </div>
+  )
+}
+
 export function CallsTable({ calls }: CallsTableProps) {
   const [selectedCall, setSelectedCall] = useState<CallWithRelations | null>(null)
 
@@ -62,6 +103,7 @@ export function CallsTable({ calls }: CallsTableProps) {
               <th className="px-4 py-3 text-left font-medium">Status</th>
               <th className="px-4 py-3 text-left font-medium">Outcome</th>
               <th className="px-4 py-3 text-left font-medium">Duration</th>
+              <th className="px-4 py-3 text-left font-medium">Cost</th>
               <th className="px-4 py-3 text-left font-medium">Time</th>
               <th className="px-4 py-3 text-left font-medium">Transcript</th>
             </tr>
@@ -69,7 +111,7 @@ export function CallsTable({ calls }: CallsTableProps) {
           <tbody>
             {calls.length === 0 ? (
               <tr>
-                <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                <td colSpan={9} className="px-4 py-8 text-center text-muted-foreground">
                   No calls yet
                 </td>
               </tr>
@@ -88,6 +130,9 @@ export function CallsTable({ calls }: CallsTableProps) {
                     ) : '—'}
                   </td>
                   <td className="px-4 py-3">{formatDuration(call.duration_seconds)}</td>
+                  <td className="px-4 py-3">
+                    <CostBreakdown call={call} />
+                  </td>
                   <td className="px-4 py-3 text-muted-foreground text-xs">
                     {formatDistanceToNow(new Date(call.created_at), { addSuffix: true })}
                   </td>
@@ -112,6 +157,26 @@ export function CallsTable({ calls }: CallsTableProps) {
               Call Transcript — {selectedCall?.leads?.business_name}
             </DialogTitle>
           </DialogHeader>
+
+          {/* Cost summary inside transcript dialog */}
+          {selectedCall && (selectedCall.cost_total ?? 0) > 0 && (
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <div className="font-semibold mb-2">Cost Breakdown</div>
+              <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-xs font-mono">
+                <span className="text-muted-foreground">Telephony (Telnyx)</span>
+                <span>{formatCost(selectedCall.cost_telephony)}</span>
+                <span className="text-muted-foreground">Speech-to-Text (Deepgram Nova-3)</span>
+                <span>{formatCost(selectedCall.cost_stt)}</span>
+                <span className="text-muted-foreground">Text-to-Speech (ElevenLabs / Deepgram)</span>
+                <span>{formatCost(selectedCall.cost_tts)}</span>
+                <span className="text-muted-foreground">LLM (Claude Haiku 4.5)</span>
+                <span>{formatCost(selectedCall.cost_llm)}</span>
+                <span className="font-semibold border-t pt-1">Total</span>
+                <span className="font-semibold border-t pt-1">{formatCost(selectedCall.cost_total)}</span>
+              </div>
+            </div>
+          )}
+
           <div className="space-y-3 mt-4">
             {selectedCall && (selectedCall.transcript as TranscriptEntry[]).map((entry, i) => (
               <div

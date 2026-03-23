@@ -27,7 +27,7 @@ export default function CallsPage() {
   useEffect(() => { fetchCalls() }, [outcome, date])
 
   function exportCSV() {
-    const headers = ['Business', 'Phone', 'Agent', 'Status', 'Outcome', 'Duration (s)', 'Created At']
+    const headers = ['Business', 'Phone', 'Agent', 'Status', 'Outcome', 'Duration (s)', 'Cost Telephony ($)', 'Cost STT ($)', 'Cost TTS ($)', 'Cost LLM ($)', 'Cost Total ($)', 'Created At']
     const rows = calls.map(c => [
       c.leads?.business_name || '',
       c.leads?.phone_number || '',
@@ -35,6 +35,11 @@ export default function CallsPage() {
       c.status,
       c.outcome || '',
       c.duration_seconds || '',
+      c.cost_telephony ?? '',
+      c.cost_stt ?? '',
+      c.cost_tts ?? '',
+      c.cost_llm ?? '',
+      c.cost_total ?? '',
       c.created_at,
     ])
     const csv = [headers, ...rows].map(r => r.map(String).join(',')).join('\n')
