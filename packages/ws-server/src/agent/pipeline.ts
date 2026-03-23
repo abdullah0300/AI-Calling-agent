@@ -258,13 +258,16 @@ export async function endSession(callControlId: string, outcome: string) {
 // Called from index.ts when Telnyx call.cost webhook arrives
 // Telnyx sends the exact telephony charge after the call ends
 export async function updateTelephonyCost(callControlId: string, costTelephony: number) {
-  const { data: call } = await supabase
+  const { data: call, error } = await supabase
     .from('calls')
     .select('cost_llm, cost_stt, cost_tts')
     .eq('telephony_call_id', callControlId)
     .single()
 
-  if (!call) return
+  if (error || !call) {
+    console.error(`[Cost] call.cost DB lookup failed for call_control_id=${callControlId}:`, error?.message ?? 'no row found')
+    return
+  }
 
   const costTotal = costTelephony + (call.cost_llm || 0) + (call.cost_stt || 0) + (call.cost_tts || 0)
   await supabase.from('calls')
