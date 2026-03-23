@@ -42,6 +42,14 @@ export type LeadStatus =
   | 'pending' | 'calling' | 'interested' | 'not_interested'
   | 'callback' | 'wrong_person' | 'no_answer' | 'error'
 
+export interface CallCostBreakdown {
+  telephony: number  // Telnyx exact cost from call.cost webhook
+  stt: number        // Deepgram Nova-3 @ $0.0077/min streaming
+  tts: number        // ElevenLabs Flash v2.5 @ $0.30/1K chars OR Deepgram Aura @ $0.030/1K chars
+  llm: number        // Claude Haiku 4.5 @ $1.00/M input + $5.00/M output tokens
+  total: number      // sum of all above
+}
+
 export interface Call {
   id: string
   lead_id: string | null
@@ -57,6 +65,11 @@ export interface Call {
   started_at: string | null
   ended_at: string | null
   created_at: string
+  cost_telephony: number | null
+  cost_stt: number | null
+  cost_tts: number | null
+  cost_llm: number | null
+  cost_total: number | null
 }
 
 export type CallStatus =

@@ -4,7 +4,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { createServer } from 'http'
 import {
   activeSessions, registerSession, attachWebSocket,
-  startSession, handleAudioChunk, endSession
+  startSession, handleAudioChunk, endSession, updateTelephonyCost
 } from './agent/pipeline'
 import type { CallSession } from '@voiceflow/shared'
 
@@ -53,6 +53,16 @@ app.post('/api/webhook/telnyx', async (req, res) => {
       if (payload?.result === 'machine' && payload?.call_control_id) {
         await endSession(payload.call_control_id, 'voicemail')
           .catch(() => {})
+      }
+      break
+
+    case 'call.cost':
+      // Telnyx sends exact telephony charge after call ends
+      // payload.cost is a string like "0.007000"
+      if (payload?.call_control_id && payload?.cost != null) {
+        const costTelephony = parseFloat(payload.cost) || 0
+        await updateTelephonyCost(payload.call_control_id, costTelephony)
+          .catch(err => console.error('[Webhook] Failed to save telephony cost:', err))
       }
       break
   }
