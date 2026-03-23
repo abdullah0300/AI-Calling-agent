@@ -56,15 +56,24 @@ app.post('/api/webhook/telnyx', async (req, res) => {
       }
       break
 
-    case 'call.cost':
+    case 'call.cost': {
       // Telnyx sends exact telephony charge after call ends
       // payload.cost is a string like "0.007000"
-      if (payload?.call_control_id && payload?.cost != null) {
-        const costTelephony = parseFloat(payload.cost) || 0
-        await updateTelephonyCost(payload.call_control_id, costTelephony)
+      console.log('[Webhook] call.cost payload:', JSON.stringify(payload))
+      const ccid = payload?.call_control_id
+      // cost can be a plain string "0.007000" or nested object { amount, currency }
+      const rawCost = payload?.cost
+      const costTelephony = typeof rawCost === 'object' && rawCost !== null
+        ? parseFloat(rawCost.amount ?? rawCost.value ?? 0)
+        : parseFloat(rawCost ?? 0)
+      if (ccid) {
+        await updateTelephonyCost(ccid, isNaN(costTelephony) ? 0 : costTelephony)
           .catch(err => console.error('[Webhook] Failed to save telephony cost:', err))
+      } else {
+        console.warn('[Webhook] call.cost missing call_control_id — cannot store cost')
       }
       break
+    }
   }
 
   res.json({ received: true })
