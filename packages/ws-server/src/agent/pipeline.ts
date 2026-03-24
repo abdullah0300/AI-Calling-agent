@@ -3,6 +3,8 @@ import { textToSpeech } from '../providers/tts'
 import { generateAgentResponse } from '../providers/llm'
 import { detectScenario, buildSystemPrompt } from './scenarios'
 import { supabase } from '../db/client'
+import { loadSettings } from '../db/settings'
+import type { PlatformSettings } from '../db/settings'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
 import type WebSocket from 'ws'
 
@@ -22,6 +24,9 @@ interface ActiveSession {
   costLlm: number
   costTts: number
   sttAudioBytes: number  // raw bytes sent to Deepgram — converted to cost at endSession
+  // Platform settings loaded from DB at session start
+  // API keys + global provider defaults, merged with per-agent overrides
+  platformSettings: PlatformSettings | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -30,7 +35,7 @@ export function registerSession(callControlId: string, session: CallSession) {
   activeSessions.set(callControlId, {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
-    costLlm: 0, costTts: 0, sttAudioBytes: 0,
+    costLlm: 0, costTts: 0, sttAudioBytes: 0, platformSettings: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -52,6 +57,11 @@ export async function startSession(callControlId: string) {
 
   const { session } = data
 
+  // Load API keys + global settings from DB
+  // Agent's active_llm/stt/tts override the global defaults for provider routing
+  const platformSettings = await loadSettings()
+  data.platformSettings = platformSettings
+
   await supabase.from('calls')
     .update({ status: 'in_progress', started_at: new Date().toISOString() })
     .eq('id', session.callId)
@@ -66,8 +76,12 @@ export async function startSession(callControlId: string) {
     session.maxDuration * 1000
   )
 
+  // Provider selection: agent field wins (per-agent override), falls back to global setting
+  const sttProvider = (session.agent.active_stt || platformSettings.active_stt) as 'deepgram' | 'google'
+
   data.sttStream = createSTTStream({
-    provider: session.agent.active_stt,
+    provider: sttProvider,
+    apiKey: platformSettings.deepgram_api_key,
     onTranscript: async (text, isFinal) => {
       if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
     },
@@ -93,7 +107,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   data.isProcessing = true
 
   try {
-    const { session, conversationHistory } = data
+    const { session, conversationHistory, platformSettings } = data
+
+    if (!platformSettings) return
 
     session.transcript.push({
       role: 'prospect', text: transcript, timestamp: new Date().toISOString()
@@ -133,9 +149,17 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
 
       default:
         try {
+          // Provider selection: agent field wins, falls back to global setting
+          const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
+          const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
+          const llmApiKey   = llmProvider === 'openai'
+            ? platformSettings.openai_api_key
+            : platformSettings.anthropic_api_key
+
           const result = await generateAgentResponse({
-            provider: session.agent.active_llm,
-            model: session.agent.active_llm_model,
+            provider: llmProvider,
+            apiKey: llmApiKey,
+            model: llmModel,
             systemPrompt: buildSystemPrompt(session.agent.system_prompt),
             conversationHistory,
             userMessage: transcript,
@@ -169,7 +193,9 @@ async function speakToProspect(callControlId: string, text: string) {
   const data = activeSessions.get(callControlId)
   if (!data) return
 
-  const { session, ws } = data
+  const { session, ws, platformSettings } = data
+
+  if (!platformSettings) return
 
   session.transcript.push({
     role: 'agent', text, timestamp: new Date().toISOString()
@@ -178,10 +204,21 @@ async function speakToProspect(callControlId: string, text: string) {
   try {
     console.log(`[Pipeline] Agent: "${text}"`)
 
+    // Provider selection: agent field wins, falls back to global setting
+    const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'google'
+    const ttsApiKey   = ttsProvider === 'elevenlabs'
+      ? platformSettings.elevenlabs_api_key
+      : platformSettings.deepgram_api_key
+
     let ttsResult: { audio: string; costUsd: number }
     try {
       ttsResult = await textToSpeech({
-        provider: session.agent.active_tts, text,
+        provider: ttsProvider,
+        apiKey: ttsApiKey,
+        voiceId: ttsProvider === 'elevenlabs'
+          ? platformSettings.elevenlabs_voice_id
+          : undefined,
+        text,
       })
       data.costTts += ttsResult.costUsd
       console.log(`[Cost] TTS +$${ttsResult.costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)

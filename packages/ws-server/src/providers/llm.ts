@@ -1,21 +1,9 @@
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
 
-let anthropicClient: Anthropic | null = null
-let openaiClient: OpenAI | null = null
-
-function getAnthropicClient() {
-  if (!anthropicClient) anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
-  return anthropicClient
-}
-
-function getOpenAIClient() {
-  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! })
-  return openaiClient
-}
-
 export interface LLMConfig {
   provider: 'anthropic' | 'openai'
+  apiKey: string
   model: string
   systemPrompt: string
   conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>
@@ -37,7 +25,8 @@ const OPENAI_OUTPUT_PER_TOKEN = 0.60 / 1_000_000   // $0.60 / 1M output tokens
 
 export async function generateAgentResponse(config: LLMConfig): Promise<LLMResult> {
   if (config.provider === 'anthropic') {
-    const response = await getAnthropicClient().messages.create({
+    const client = new Anthropic({ apiKey: config.apiKey })
+    const response = await client.messages.create({
       model: config.model,
       max_tokens: 150,
       system: config.systemPrompt,
@@ -54,7 +43,8 @@ export async function generateAgentResponse(config: LLMConfig): Promise<LLMResul
     return { text, costUsd }
   }
 
-  const response = await getOpenAIClient().chat.completions.create({
+  const client = new OpenAI({ apiKey: config.apiKey })
+  const response = await client.chat.completions.create({
     model: config.model,
     max_tokens: 150,
     messages: [

@@ -2,6 +2,7 @@ import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk'
 
 export interface STTStreamConfig {
   provider: 'deepgram' | 'google'
+  apiKey: string
   onTranscript: (text: string, isFinal: boolean) => void
   onError: (error: Error) => void
 }
@@ -12,7 +13,7 @@ export function createSTTStream(config: STTStreamConfig) {
 }
 
 function createDeepgramStream(config: STTStreamConfig) {
-  const deepgram = createClient(process.env.DEEPGRAM_API_KEY!)
+  const deepgram = createClient(config.apiKey)
 
   const connection = deepgram.listen.live({
     model: 'nova-3',

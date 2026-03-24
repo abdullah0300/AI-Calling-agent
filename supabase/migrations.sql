@@ -101,7 +101,15 @@ insert into public.settings (key, value) values
   ('active_stt', 'deepgram'),
   ('active_tts', 'elevenlabs'),
   ('active_llm', 'anthropic'),
-  ('active_llm_model', 'claude-haiku-4-5');
+  ('active_llm_model', 'claude-haiku-4-5'),
+  -- API keys (enter values via the Settings page — never commit real keys here)
+  ('telnyx_api_key', ''),
+  ('telnyx_connection_id', ''),
+  ('deepgram_api_key', ''),
+  ('elevenlabs_api_key', ''),
+  ('elevenlabs_voice_id', '21m00Tcm4TlvDq8ikWAM'),
+  ('anthropic_api_key', ''),
+  ('openai_api_key', '');
 
 -- 7. Row Level Security
 alter table public.agents enable row level security;
@@ -118,6 +126,7 @@ create policy "Allow authenticated" on public.settings for all using (auth.role(
 create policy "Service role bypass calls" on public.calls for all using (auth.role() = 'service_role');
 create policy "Service role bypass leads" on public.leads for all using (auth.role() = 'service_role');
 create policy "Service role bypass agents" on public.agents for all using (auth.role() = 'service_role');
+create policy "Service role bypass settings" on public.settings for all using (auth.role() = 'service_role');
 
 -- 8. Default WebCraftio Sales Agent
 insert into public.agents (
@@ -137,3 +146,13 @@ insert into public.agents (
   'Of course, completely understand. What time works better — morning or afternoon? And is there a specific person I should ask for?',
   180, 'anthropic', 'claude-haiku-4-5', 'elevenlabs', 'deepgram', 'telnyx'
 );
+
+-- Migration: if settings table already exists, run these inserts to add the API key rows:
+-- insert into public.settings (key, value) values ('telnyx_api_key', '') on conflict (key) do nothing;
+-- insert into public.settings (key, value) values ('telnyx_connection_id', '') on conflict (key) do nothing;
+-- insert into public.settings (key, value) values ('deepgram_api_key', '') on conflict (key) do nothing;
+-- insert into public.settings (key, value) values ('elevenlabs_api_key', '') on conflict (key) do nothing;
+-- insert into public.settings (key, value) values ('elevenlabs_voice_id', '21m00Tcm4TlvDq8ikWAM') on conflict (key) do nothing;
+-- insert into public.settings (key, value) values ('anthropic_api_key', '') on conflict (key) do nothing;
+-- insert into public.settings (key, value) values ('openai_api_key', '') on conflict (key) do nothing;
+-- create policy "Service role bypass settings" on public.settings for all using (auth.role() = 'service_role');
