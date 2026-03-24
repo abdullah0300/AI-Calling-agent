@@ -19,8 +19,9 @@ const patchSchema = z.object({
 
 export async function PATCH(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params
   try {
     const body = await req.json()
     const parsed = patchSchema.safeParse(body)
@@ -33,7 +34,7 @@ export async function PATCH(
     const { data, error } = await supabase
       .from('leads')
       .update({ ...parsed.data, updated_at: new Date().toISOString() })
-      .eq('id', params.id)
+      .eq('id', id)
       .select()
       .single()
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
@@ -45,9 +46,10 @@ export async function PATCH(
 
 export async function DELETE(
   _req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const { error } = await supabase.from('leads').delete().eq('id', params.id)
+  const { id } = await params
+  const { error } = await supabase.from('leads').delete().eq('id', id)
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
   return NextResponse.json({ success: true })
 }
