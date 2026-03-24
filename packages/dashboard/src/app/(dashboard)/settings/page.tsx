@@ -7,7 +7,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
-import { createClient } from '@/lib/supabase/client'
 
 interface Setting {
   key: string
@@ -37,14 +36,26 @@ const providerDescriptions: Record<string, string> = {
 
 // API keys managed in the settings table — shown masked, never revealed after save
 const apiKeyFields = [
-  { key: 'telnyx_api_key',       label: 'Telnyx API Key',         placeholder: 'KEY...',         hint: 'Required for outbound calls' },
-  { key: 'telnyx_connection_id', label: 'Telnyx Connection ID',   placeholder: 'YOUR_CONN_ID',   hint: 'TeXML / WebRTC App connection ID' },
-  { key: 'deepgram_api_key',     label: 'Deepgram API Key',       placeholder: 'YOUR_API_KEY',   hint: 'Used for STT and Deepgram TTS' },
-  { key: 'elevenlabs_api_key',   label: 'ElevenLabs API Key',     placeholder: 'YOUR_API_KEY',   hint: 'Used when TTS provider is ElevenLabs' },
+  { key: 'telnyx_api_key',       label: 'Telnyx API Key',         placeholder: 'KEY...',               hint: 'Required for outbound calls' },
+  { key: 'telnyx_connection_id', label: 'Telnyx Connection ID',   placeholder: 'YOUR_CONN_ID',         hint: 'TeXML / WebRTC App connection ID' },
+  { key: 'deepgram_api_key',     label: 'Deepgram API Key',       placeholder: 'YOUR_API_KEY',         hint: 'Used for STT and Deepgram TTS' },
+  { key: 'elevenlabs_api_key',   label: 'ElevenLabs API Key',     placeholder: 'YOUR_API_KEY',         hint: 'Used when TTS provider is ElevenLabs' },
   { key: 'elevenlabs_voice_id',  label: 'ElevenLabs Voice ID',    placeholder: '21m00Tcm4TlvDq8ikWAM', hint: 'Voice ID from your ElevenLabs library' },
-  { key: 'anthropic_api_key',    label: 'Anthropic API Key',      placeholder: 'sk-ant-...',     hint: 'Used when LLM provider is Anthropic' },
-  { key: 'openai_api_key',       label: 'OpenAI API Key',         placeholder: 'sk-...',         hint: 'Used when LLM provider is OpenAI' },
+  { key: 'anthropic_api_key',    label: 'Anthropic API Key',      placeholder: 'sk-ant-...',           hint: 'Used when LLM provider is Anthropic' },
+  { key: 'openai_api_key',       label: 'OpenAI API Key',         placeholder: 'sk-...',               hint: 'Used when LLM provider is OpenAI' },
 ]
+
+async function saveSetting(key: string, value: string) {
+  const res = await fetch('/api/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, value }),
+  })
+  if (!res.ok) {
+    const data = await res.json()
+    throw new Error(data.error || 'Failed to save')
+  }
+}
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<Setting[]>([])
@@ -53,12 +64,13 @@ export default function SettingsPage() {
   const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({})
   const [savingKey, setSavingKey] = useState<string | null>(null)
   const [savedKey, setSavedKey] = useState<string | null>(null)
-  const supabase = createClient()
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    supabase.from('settings').select('*').then(({ data }) => {
-      if (data) setSettings(data)
-    })
+    fetch('/api/settings')
+      .then(r => r.json())
+      .then(data => { if (data.settings) setSettings(data.settings) })
+      .catch(() => setError('Failed to load settings'))
   }, [])
 
   function getSetting(key: string) {
@@ -67,32 +79,36 @@ export default function SettingsPage() {
 
   async function updateProvider(key: string, value: string) {
     setSavingProvider(key)
-    await supabase
-      .from('settings')
-      .update({ value, updated_at: new Date().toISOString() })
-      .eq('key', key)
-    setSettings(prev => prev.map(s => s.key === key ? { ...s, value } : s))
-    setSavingProvider(null)
+    try {
+      await saveSetting(key, value)
+      setSettings(prev => prev.map(s => s.key === key ? { ...s, value } : s))
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setSavingProvider(null)
+    }
   }
 
   async function saveApiKey(key: string) {
     const value = keyDrafts[key]
     if (!value?.trim()) return
     setSavingKey(key)
-    // Upsert so it works whether or not the row exists yet
-    await supabase.from('settings').upsert(
-      { key, value: value.trim(), updated_at: new Date().toISOString() },
-      { onConflict: 'key' }
-    )
-    setSettings(prev => {
-      const exists = prev.find(s => s.key === key)
-      if (exists) return prev.map(s => s.key === key ? { ...s, value: value.trim() } : s)
-      return [...prev, { key, value: value.trim() }]
-    })
-    setKeyDrafts(prev => ({ ...prev, [key]: '' }))
-    setSavingKey(null)
-    setSavedKey(key)
-    setTimeout(() => setSavedKey(null), 2000)
+    setError(null)
+    try {
+      await saveSetting(key, value.trim())
+      setSettings(prev => {
+        const exists = prev.find(s => s.key === key)
+        if (exists) return prev.map(s => s.key === key ? { ...s, value: value.trim() } : s)
+        return [...prev, { key, value: value.trim() }]
+      })
+      setKeyDrafts(prev => ({ ...prev, [key]: '' }))
+      setSavedKey(key)
+      setTimeout(() => setSavedKey(null), 2000)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setSavingKey(null)
+    }
   }
 
   const providerKeys = ['active_telephony', 'active_stt', 'active_tts', 'active_llm']
@@ -103,6 +119,10 @@ export default function SettingsPage() {
         <h1 className="text-2xl font-bold">Settings</h1>
         <p className="text-muted-foreground">Configure global provider defaults and API keys</p>
       </div>
+
+      {error && (
+        <p className="text-sm text-destructive">{error}</p>
+      )}
 
       {/* Global Provider Defaults */}
       <div className="space-y-4">
