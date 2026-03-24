@@ -51,12 +51,18 @@ async function elevenLabsTTS(config: TTSConfig): Promise<TTSResult> {
 
   if (!response.ok) {
     const body = await response.text()
-    // Free plan cannot use library voices — fall back to Deepgram automatically
-    if (response.status === 402) {
-      console.warn('[TTS] ElevenLabs 402: falling back to Deepgram')
-      return deepgramTTS(config)
-    }
-    throw new Error(`ElevenLabs failed: ${response.status} ${body}`)
+    let detail = body
+    try {
+      const parsed = JSON.parse(body)
+      detail = parsed?.detail?.message || parsed?.detail || body
+    } catch {}
+    const reason =
+      response.status === 401 ? 'Invalid or missing ElevenLabs API key.' :
+      response.status === 402 ? 'ElevenLabs account has insufficient credits or the plan does not support this voice. Please top up your account or upgrade your plan at elevenlabs.io.' :
+      response.status === 422 ? `ElevenLabs rejected the request — ${detail}` :
+      response.status === 429 ? 'ElevenLabs rate limit reached. Too many requests in a short period.' :
+      `ElevenLabs returned an unexpected error (HTTP ${response.status}) — ${detail}`
+    throw new Error(reason)
   }
 
   const audio = Buffer.from(await response.arrayBuffer()).toString('base64')

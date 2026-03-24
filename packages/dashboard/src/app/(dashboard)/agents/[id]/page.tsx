@@ -29,24 +29,138 @@ import {
   AlertCircle,
 } from 'lucide-react'
 
-const DEFAULT_AGENT: Partial<Agent> = {
-  name: '',
-  description: '',
-  system_prompt: '',
-  greeting_message: '',
-  interest_detected_message: '',
-  not_interested_message: '',
-  wrong_person_message: '',
-  callback_message: '',
-  max_call_duration_seconds: 180,
-  active_llm: 'anthropic',
-  active_llm_model: 'claude-haiku-4-5',
-  active_tts: 'elevenlabs',
-  active_stt: 'deepgram',
-  active_telephony: 'telnyx',
+// ── Vapi-style prompt sections ───────────────────────────────────────────────
+
+interface PromptSections {
+  identity: string
+  style: string
+  responseGuideline: string
+  task: string
+  errorHandling: string
 }
 
-const messageFields = [
+const EMPTY_SECTIONS: PromptSections = {
+  identity: '',
+  style: '',
+  responseGuideline: '',
+  task: '',
+  errorHandling: '',
+}
+
+/** Parse a stored system_prompt string back into its five Vapi sections. */
+function parsePromptSections(prompt: string): PromptSections {
+  if (!prompt?.trim()) return { ...EMPTY_SECTIONS }
+
+  const headerRegex = /^\[(Identity|Style|Response Guideline|Task|Error Handling|Context)\]\s*$/im
+  const keyMap: Record<string, keyof PromptSections> = {
+    identity: 'identity',
+    style: 'style',
+    'response guideline': 'responseGuideline',
+    task: 'task',
+    'error handling': 'errorHandling',
+  }
+
+  const lines = prompt.split('\n')
+  const result = { ...EMPTY_SECTIONS }
+  let current: keyof PromptSections | null = null
+  const buffer: string[] = []
+
+  function flush() {
+    if (current) {
+      result[current] = buffer.join('\n').trim()
+      buffer.length = 0
+    }
+  }
+
+  for (const line of lines) {
+    const match = line.match(/^\[(.+?)\]\s*$/)
+    if (match) {
+      const key = match[1].toLowerCase()
+      if (keyMap[key]) {
+        flush()
+        current = keyMap[key]
+        continue
+      }
+      // [Context] and unknown headers — skip header line, stop capturing
+      flush()
+      current = null
+      continue
+    }
+    if (current) buffer.push(line)
+  }
+  flush()
+
+  // Legacy flat prompt (no sections found) — put entire text in identity
+  const hasAnySections = Object.values(result).some(v => v.trim())
+  if (!hasAnySections) result.identity = prompt.trim()
+
+  return result
+}
+
+/** Assemble five sections into the stored system_prompt string. */
+function assembleSystemPrompt(s: PromptSections): string {
+  const parts: string[] = []
+  if (s.identity.trim())          parts.push(`[Identity]\n${s.identity.trim()}`)
+  if (s.style.trim())             parts.push(`[Style]\n${s.style.trim()}`)
+  if (s.responseGuideline.trim()) parts.push(`[Response Guideline]\n${s.responseGuideline.trim()}`)
+  if (s.task.trim())              parts.push(`[Task]\n${s.task.trim()}`)
+  if (s.errorHandling.trim())     parts.push(`[Error Handling]\n${s.errorHandling.trim()}`)
+  return parts.join('\n\n')
+}
+
+// ── Section definitions ──────────────────────────────────────────────────────
+
+const PROMPT_SECTIONS = [
+  {
+    key: 'identity' as keyof PromptSections,
+    label: '[Identity]',
+    subtitle: 'Who the agent is — name, company, role, and goal',
+    rows: 4,
+    placeholder:
+      'You are Sarah, a friendly outbound representative for WebCraftio, a UK-based AI agency. You call business owners to introduce AI voice agents that automate customer calls. Your ONLY goal is to detect interest and arrange a specialist callback.',
+    hint: 'Define the agent\'s name, company, and purpose. This is the first thing the LLM reads — be specific about who they are and what success looks like.',
+  },
+  {
+    key: 'style' as keyof PromptSections,
+    label: '[Style]',
+    subtitle: 'Tone, pacing, and speaking rules',
+    rows: 4,
+    placeholder:
+      '- Warm, confident, and professional. Never pushy or salesy.\n- Keep every response under 30 words. You are speaking aloud, not writing.\n- Short sentences. Natural human speech patterns.\n- No bullet points or markdown when speaking.',
+    hint: 'Controls how the agent sounds. Voice agents need different rules than text — keep responses short, no lists, no markdown.',
+  },
+  {
+    key: 'responseGuideline' as keyof PromptSections,
+    label: '[Response Guideline]',
+    subtitle: 'Rules the agent must always follow',
+    rows: 4,
+    placeholder:
+      '- Ask only one question at a time — never stack two questions.\n- Spell numbers in words (say "five hundred" not "500").\n- Never quote prices or try to close a sale.\n- Never hang up without getting at least a name, callback time, or email.',
+    hint: 'Hard constraints the agent must never break. Use clear, direct language — "never", "always", "only".',
+  },
+  {
+    key: 'task' as keyof PromptSections,
+    label: '[Task]',
+    subtitle: 'Numbered call flow with <wait for user response> between steps',
+    rows: 8,
+    placeholder:
+      '1. Greet the prospect and introduce yourself and the company.\n<wait for user response>\n2. Ask: "Have you looked into AI automation for your business at all?"\n<wait for user response>\n3. If curious, briefly describe what you offer in one sentence.\n<wait for user response>\n4. Offer a callback: "I can have one of our specialists call you — morning or afternoon works better?"\n<wait for user response>\n5. Confirm the slot, thank them, and close the call.',
+    hint: 'The step-by-step script. The <wait for user response> tag is critical — without it the agent rushes through steps like a monologue.',
+  },
+  {
+    key: 'errorHandling' as keyof PromptSections,
+    label: '[Error Handling]',
+    subtitle: 'What to say when the conversation goes off-script',
+    rows: 3,
+    placeholder:
+      '- If unclear: "I am sorry, I did not quite catch that. Could you say that again?"\n- If asked something outside your scope: "That is a great question for our specialist on the callback."\n- If silence for a few seconds: "Hello, are you still there?"',
+    hint: 'Fallback instructions keep the agent from getting stuck or hallucinating when the prospect says something unexpected.',
+  },
+]
+
+// ── Conversation scripts ─────────────────────────────────────────────────────
+
+const MESSAGE_FIELDS = [
   {
     field: 'greeting_message',
     label: 'Opening Greeting',
@@ -94,6 +208,27 @@ const messageFields = [
   },
 ]
 
+// ── Default state ─────────────────────────────────────────────────────────────
+
+const DEFAULT_AGENT: Partial<Agent> = {
+  name: '',
+  description: '',
+  system_prompt: '',
+  greeting_message: '',
+  interest_detected_message: '',
+  not_interested_message: '',
+  wrong_person_message: '',
+  callback_message: '',
+  max_call_duration_seconds: 180,
+  active_llm: 'anthropic',
+  active_llm_model: 'claude-haiku-4-5',
+  active_tts: 'elevenlabs',
+  active_stt: 'deepgram',
+  active_telephony: 'telnyx',
+}
+
+// ── Page component ────────────────────────────────────────────────────────────
+
 export default function AgentEditPage() {
   const params = useParams()
   const router = useRouter()
@@ -101,6 +236,7 @@ export default function AgentEditPage() {
   const isNew = id === 'new'
 
   const [agent, setAgent] = useState<Partial<Agent>>(DEFAULT_AGENT)
+  const [sections, setSections] = useState<PromptSections>({ ...EMPTY_SECTIONS })
   const [saving, setSaving] = useState(false)
   const [loading, setLoading] = useState(!isNew)
   const [error, setError] = useState('')
@@ -110,7 +246,12 @@ export default function AgentEditPage() {
     if (!isNew) {
       fetch(`/api/agents/${id}`)
         .then(r => r.json())
-        .then(data => { if (data.agent) setAgent(data.agent) })
+        .then(data => {
+          if (data.agent) {
+            setAgent(data.agent)
+            setSections(parsePromptSections(data.agent.system_prompt || ''))
+          }
+        })
         .catch(console.error)
         .finally(() => setLoading(false))
     }
@@ -118,6 +259,13 @@ export default function AgentEditPage() {
 
   function handleChange(field: keyof Agent, value: string | number) {
     setAgent(prev => ({ ...prev, [field]: value }))
+    setSuccess(false)
+  }
+
+  function handleSectionChange(key: keyof PromptSections, value: string) {
+    const next = { ...sections, [key]: value }
+    setSections(next)
+    setAgent(prev => ({ ...prev, system_prompt: assembleSystemPrompt(next) }))
     setSuccess(false)
   }
 
@@ -148,7 +296,6 @@ export default function AgentEditPage() {
 
   const maxDuration = agent.max_call_duration_seconds || 180
 
-  /* ── Loading skeleton ── */
   if (loading) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -192,11 +339,12 @@ export default function AgentEditPage() {
       </div>
 
       <div className="space-y-6">
+
         {/* ── Section 1: Identity ── */}
         <Section
           number={1}
           title="Agent Identity"
-          subtitle="Name, description, and core behaviour instructions"
+          subtitle="Name and description for this agent"
         >
           <FieldGroup
             label="Agent Name"
@@ -222,43 +370,67 @@ export default function AgentEditPage() {
               className="bg-slate-50"
             />
           </FieldGroup>
-
-          <FieldGroup
-            label="System Prompt"
-            required
-            hint=""
-            charCount={(agent.system_prompt || '').length}
-          >
-            <Textarea
-              value={agent.system_prompt || ''}
-              onChange={e => handleChange('system_prompt', e.target.value)}
-              placeholder="You are a friendly outbound representative for WebCraftio, a UK-based web development and AI agency…"
-              rows={7}
-              className="bg-slate-50 resize-none"
-            />
-            <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 flex gap-3">
-              <Info className="h-4 w-4 text-blue-500 shrink-0 mt-0.5" />
-              <div className="text-xs text-blue-700 space-y-1.5">
-                <p className="font-semibold">Tips for an effective system prompt:</p>
-                <ul className="space-y-1 text-blue-600 list-disc list-inside">
-                  <li>Define the agent&apos;s role, company, and services clearly</li>
-                  <li>Set a single, clear goal (e.g. &quot;Your ONLY goal is to detect interest&quot;)</li>
-                  <li>State what the agent must NOT do (e.g. &quot;Never quote prices or try to sell directly&quot;)</li>
-                  <li>Describe the tone (e.g. &quot;Friendly, concise, professional, never pushy&quot;)</li>
-                </ul>
-              </div>
-            </div>
-          </FieldGroup>
         </Section>
 
-        {/* ── Section 2: Conversation Scripts ── */}
+        {/* ── Section 2: System Prompt (Vapi Structure) ── */}
         <Section
           number={2}
+          title="System Prompt"
+          subtitle="Industry-standard Vapi prompt structure — fill in each section to build the agent's behaviour"
+          icon={<Bot className="h-4 w-4 text-blue-600" />}
+        >
+          {/* Info banner */}
+          <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 flex gap-3">
+            <Info className="h-4 w-4 text-blue-500 shrink-0 mt-0.5" />
+            <div className="text-xs text-blue-700 space-y-1">
+              <p className="font-semibold">Industry-standard Vapi prompt format</p>
+              <p className="text-blue-600 leading-relaxed">
+                Each section tells the AI a different thing. <strong>[Identity]</strong> defines who it is.{' '}
+                <strong>[Style]</strong> controls how it speaks. <strong>[Task]</strong> is the actual call script —
+                use <code className="bg-blue-100 px-1 rounded">{'<wait for user response>'}</code> between steps
+                so the agent doesn&apos;t rush through like a monologue.
+              </p>
+            </div>
+          </div>
+
+          {PROMPT_SECTIONS.map(({ key, label, subtitle, rows, placeholder, hint }) => (
+            <div key={key} className="space-y-1.5">
+              <div className="flex flex-wrap items-baseline gap-2">
+                <Label className="font-semibold text-slate-800 text-sm font-mono">{label}</Label>
+                <span className="text-xs text-slate-400">{subtitle}</span>
+                <span className="ml-auto text-xs text-slate-400">
+                  {(sections[key] || '').length} chars
+                </span>
+              </div>
+              <Textarea
+                value={sections[key] || ''}
+                onChange={e => handleSectionChange(key, e.target.value)}
+                placeholder={placeholder}
+                rows={rows}
+                className="bg-slate-50 resize-none text-sm font-mono"
+              />
+              <p className="text-xs text-slate-400 leading-relaxed">{hint}</p>
+            </div>
+          ))}
+        </Section>
+
+        {/* ── Section 3: Conversation Scripts ── */}
+        <Section
+          number={3}
           title="Conversation Scripts"
-          subtitle="What the agent says in each call scenario — triggered automatically by the AI"
+          subtitle="Pre-scripted responses fired instantly by keyword detection — no LLM call, zero latency"
           icon={<MessageSquare className="h-4 w-4 text-blue-600" />}
         >
-          {messageFields.map(({ field, label, emoji, trigger, placeholder, hint }) => (
+          <div className="bg-amber-50 border border-amber-100 rounded-xl p-4 flex gap-3">
+            <Info className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" />
+            <p className="text-xs text-amber-700 leading-relaxed">
+              These messages are triggered directly by the pipeline — no AI generation involved.
+              They fire instantly when keywords are detected (e.g. &quot;not interested&quot;, &quot;call back&quot;).
+              Keep them natural and match the voice in your system prompt.
+            </p>
+          </div>
+
+          {MESSAGE_FIELDS.map(({ field, label, emoji, trigger, placeholder, hint }) => (
             <div key={field} className="space-y-1.5">
               <div className="flex flex-wrap items-center gap-2 mb-1">
                 <span className="text-base">{emoji}</span>
@@ -271,9 +443,7 @@ export default function AgentEditPage() {
               </div>
               <Textarea
                 value={(agent as any)[field] || ''}
-                onChange={e =>
-                  handleChange(field as keyof Agent, e.target.value)
-                }
+                onChange={e => handleChange(field as keyof Agent, e.target.value)}
                 placeholder={placeholder}
                 rows={2}
                 className="bg-slate-50 resize-none text-sm"
@@ -283,9 +453,9 @@ export default function AgentEditPage() {
           ))}
         </Section>
 
-        {/* ── Section 3: Technology Stack ── */}
+        {/* ── Section 4: Technology Stack ── */}
         <Section
-          number={3}
+          number={4}
           title="Technology Stack"
           subtitle="AI providers and call configuration for this agent"
           icon={<Cpu className="h-4 w-4 text-blue-600" />}
@@ -337,7 +507,7 @@ export default function AgentEditPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="elevenlabs">ElevenLabs — Most natural</SelectItem>
-                  <SelectItem value="deepgram">Deepgram Aura — Fast & cheap</SelectItem>
+                  <SelectItem value="deepgram">Deepgram Aura — Fast &amp; cheap</SelectItem>
                   <SelectItem value="google">Google TTS</SelectItem>
                 </SelectContent>
               </Select>
@@ -418,9 +588,7 @@ export default function AgentEditPage() {
         {success && (
           <div className="flex items-center gap-3 bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3">
             <CheckCircle className="h-5 w-5 text-emerald-500 shrink-0" />
-            <p className="text-sm text-emerald-700">
-              Agent saved successfully!
-            </p>
+            <p className="text-sm text-emerald-700">Agent saved successfully!</p>
           </div>
         )}
 
@@ -456,7 +624,7 @@ export default function AgentEditPage() {
   )
 }
 
-/* ── Sub-components ── */
+// ── Sub-components ────────────────────────────────────────────────────────────
 
 function Section({
   number,
@@ -492,14 +660,12 @@ function FieldGroup({
   label,
   required,
   hint,
-  charCount,
   icon,
   children,
 }: {
   label: string
   required?: boolean
   hint: string
-  charCount?: number
   icon?: React.ReactNode
   children: React.ReactNode
 }) {
@@ -511,9 +677,6 @@ function FieldGroup({
           {label}
           {required && <span className="text-red-500 ml-0.5">*</span>}
         </Label>
-        {charCount !== undefined && (
-          <span className="ml-auto text-xs text-slate-400">{charCount} chars</span>
-        )}
       </div>
       {children}
       {hint && <p className="text-xs text-slate-400 leading-relaxed">{hint}</p>}

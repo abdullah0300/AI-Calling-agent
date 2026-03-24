@@ -160,7 +160,11 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
             provider: llmProvider,
             apiKey: llmApiKey,
             model: llmModel,
-            systemPrompt: buildSystemPrompt(session.agent.system_prompt),
+            systemPrompt: buildSystemPrompt(session.agent.system_prompt, {
+              businessName: session.lead.business_name,
+              industry: session.lead.industry,
+              city: session.lead.city || undefined,
+            }),
             conversationHistory,
             userMessage: transcript,
           })
@@ -223,7 +227,10 @@ async function speakToProspect(callControlId: string, text: string) {
       data.costTts += ttsResult.costUsd
       console.log(`[Cost] TTS +$${ttsResult.costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
     } catch (ttsError) {
-      console.error(`[Pipeline] TTS error ${callControlId}:`, ttsError)
+      const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
+      console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
+      // End the call immediately — the prospect would hear silence otherwise
+      endSession(callControlId, 'error')
       return
     }
 
