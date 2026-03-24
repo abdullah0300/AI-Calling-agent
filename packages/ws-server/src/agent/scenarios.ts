@@ -10,7 +10,9 @@ export function detectScenario(transcript: string): ScenarioType {
 
   const notInterestedPhrases = [
     'not interested', 'no thank you', 'no thanks', 'please remove',
-    "don't call", 'stop calling', 'already have', 'not looking', 'bye', 'goodbye'
+    "don't call", 'stop calling', 'not looking', 'bye', 'goodbye'
+    // NOTE: "already have" is intentionally excluded — it is an objection to handle,
+    // not a flat rejection. The [Task] section script addresses it directly.
   ]
   if (notInterestedPhrases.some(p => text.includes(p))) return 'not_interested'
 
