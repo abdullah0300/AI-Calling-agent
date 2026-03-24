@@ -19,6 +19,95 @@ const ELEVENLABS_PER_CHAR = 0.30 / 1_000
 // (source: deepgram.com/pricing)
 const DEEPGRAM_TTS_PER_CHAR = 0.030 / 1_000
 
+export interface TTSStreamConfig extends TTSConfig {
+  // Called with each base64-encoded audio chunk as it arrives from the TTS provider.
+  // Caller should send each chunk to the WebSocket immediately.
+  onChunk: (base64Audio: string) => void
+}
+
+// Streams TTS audio chunks as they arrive, calling onChunk for each.
+// Returns costUsd. Throws on provider error.
+export async function streamTextToSpeech(config: TTSStreamConfig): Promise<number> {
+  switch (config.provider) {
+    case 'elevenlabs': return elevenLabsStreamingTTS(config)
+    case 'deepgram':   return deepgramStreamingTTS(config)
+    default: throw new Error(`Streaming TTS not implemented for provider: ${config.provider}`)
+  }
+}
+
+async function elevenLabsStreamingTTS(config: TTSStreamConfig): Promise<number> {
+  const voiceId = config.voiceId || '21m00Tcm4TlvDq8ikWAM'
+
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
+    {
+      method: 'POST',
+      headers: { 'xi-api-key': config.apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: config.text,
+        model_id: 'eleven_flash_v2_5',
+        voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.0, use_speaker_boost: true },
+        output_format: 'mp3_44100_128',
+        optimize_streaming_latency: 4,
+      }),
+    }
+  )
+
+  if (!response.ok) {
+    const body = await response.text()
+    let detail = body
+    try {
+      const parsed = JSON.parse(body)
+      detail = parsed?.detail?.message || parsed?.detail || body
+    } catch {}
+    const reason =
+      response.status === 401 ? 'Invalid or missing ElevenLabs API key.' :
+      response.status === 402 ? 'ElevenLabs account has insufficient credits or the plan does not support this voice. Please top up your account or upgrade your plan at elevenlabs.io.' :
+      response.status === 422 ? `ElevenLabs rejected the request — ${detail}` :
+      response.status === 429 ? 'ElevenLabs rate limit reached. Too many requests in a short period.' :
+      `ElevenLabs returned an unexpected error (HTTP ${response.status}) — ${detail}`
+    throw new Error(reason)
+  }
+
+  if (!response.body) throw new Error('ElevenLabs streaming TTS: no response body')
+
+  const reader = response.body.getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value && value.length > 0) {
+      config.onChunk(Buffer.from(value).toString('base64'))
+    }
+  }
+
+  return config.text.length * ELEVENLABS_PER_CHAR
+}
+
+async function deepgramStreamingTTS(config: TTSStreamConfig): Promise<number> {
+  const voice = config.voiceId || 'aura-asteria-en'
+  const response = await fetch(
+    `https://api.deepgram.com/v1/speak?model=${voice}&encoding=mp3`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Token ${config.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: config.text }),
+    }
+  )
+  if (!response.ok) throw new Error(`Deepgram TTS failed: ${response.status} ${await response.text()}`)
+  if (!response.body) throw new Error('Deepgram streaming TTS: no response body')
+
+  const reader = response.body.getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value && value.length > 0) {
+      config.onChunk(Buffer.from(value).toString('base64'))
+    }
+  }
+
+  return config.text.length * DEEPGRAM_TTS_PER_CHAR
+}
+
 export async function textToSpeech(config: TTSConfig): Promise<TTSResult> {
   switch (config.provider) {
     case 'elevenlabs': return elevenLabsTTS(config)
