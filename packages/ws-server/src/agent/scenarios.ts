@@ -37,18 +37,67 @@ export function detectScenario(transcript: string): ScenarioType {
   return 'unknown'
 }
 
-export function buildSystemPrompt(systemPrompt: string): string {
-  return `${systemPrompt}
+interface LeadContext {
+  businessName?: string
+  industry?: string
+  city?: string
+}
 
-CRITICAL VOICE RULES — ALWAYS FOLLOW:
-1. Keep every response under 40 words. You are speaking aloud not writing.
-2. Never use bullet points, lists, or markdown. Speak naturally.
-3. Never hang up without getting at least one of: decision maker name, callback time, or email.
-4. If someone is busy ask: "What time works better — morning or afternoon?"
-5. If not the right person ask: "Who would be the right person to speak to?"
-6. Never try to close a sale. Your ONLY job is to detect interest and book a callback.
-7. If interested say: "Great! I will have one of our specialists call you back. Morning or afternoon?"
-8. Sound natural. Short sentences. Real human speech patterns.
-9. If you detect a voicemail greeting say nothing and end immediately.
-10. The call has a strict maximum duration — wrap up gracefully before time runs out.`
+// Default voice rules used for legacy flat prompts (backward compatibility).
+// New structured prompts ([Identity]/[Style]/[Task] format) carry their own rules.
+const VOICE_STYLE = `- Keep every response under 30 words. You are speaking aloud, not writing.
+- Never use bullet points, lists, or markdown. Speak naturally.
+- Short sentences. Real human speech patterns.
+- Never pushy or salesy. Warm and confident.`
+
+const VOICE_GUIDELINE = `- Ask only one question at a time — never stack two questions.
+- Spell numbers in words (say "five hundred" not "500").
+- Never quote prices or try to sell directly.
+- Your ONLY goal is to detect interest and arrange a specialist callback.
+- Never hang up without getting at least one of: decision maker name, callback time, or email.
+- The call has a strict maximum duration — wrap up gracefully before time runs out.`
+
+const VOICE_ERROR_HANDLING = `- If you did not understand: "I am sorry, I did not quite catch that. Could you say that again?"
+- If asked something outside your scope: "That is a great question for our specialist — they will cover that on the callback."
+- If the line goes silent, gently prompt: "Hello, are you still there?"
+- If you detect a voicemail greeting, say nothing and end the call immediately.`
+
+export function buildSystemPrompt(systemPrompt: string, context?: LeadContext): string {
+  // Inject prospect context line (used in both structured and legacy paths)
+  const contextLine = context?.businessName
+    ? `\nYou are currently speaking with someone at ${context.businessName}${context.industry ? `, a ${context.industry} business` : ''}${context.city ? ` in ${context.city}` : ''}.`
+    : ''
+
+  // Structured Vapi-format prompt — user has already defined [Identity]/[Style]/[Task] etc.
+  // Just append prospect context so the LLM knows who it is speaking with.
+  const isStructured = /\[(Identity|Style|Task|Response Guideline|Error Handling)\]/i.test(systemPrompt)
+  if (isStructured) {
+    return contextLine
+      ? `${systemPrompt}\n\n[Context]${contextLine}`
+      : systemPrompt
+  }
+
+  // Legacy flat prompt — wrap in Vapi structure so the LLM gets the same quality guidance.
+  return `[Identity]
+${systemPrompt.trim()}${contextLine}
+
+[Style]
+${VOICE_STYLE}
+
+[Response Guideline]
+${VOICE_GUIDELINE}
+
+[Task]
+1. Greet the prospect and introduce yourself and your company.
+<wait for user response>
+2. State the purpose of the call in one sentence.
+<wait for user response>
+3. Ask a qualifying question to gauge interest.
+<wait for user response>
+4. If interested, offer a specialist callback and ask: "Morning or afternoon works better?"
+<wait for user response>
+5. Confirm the callback slot, thank them, and close the call politely.
+
+[Error Handling]
+${VOICE_ERROR_HANDLING}`
 }
