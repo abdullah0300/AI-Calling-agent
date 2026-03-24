@@ -1,6 +1,6 @@
 import { createSTTStream } from '../providers/stt'
-import { textToSpeech } from '../providers/tts'
-import { generateAgentResponse } from '../providers/llm'
+import { streamTextToSpeech } from '../providers/tts'
+import { streamAgentResponse } from '../providers/llm'
 import { detectScenario, buildSystemPrompt } from './scenarios'
 import { supabase } from '../db/client'
 import { loadSettings } from '../db/settings'
@@ -155,8 +155,15 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
           const llmApiKey   = llmProvider === 'openai'
             ? platformSettings.openai_api_key
             : platformSettings.anthropic_api_key
+          const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'google'
+          const ttsApiKey   = ttsProvider === 'elevenlabs'
+            ? platformSettings.elevenlabs_api_key
+            : platformSettings.deepgram_api_key
+          const ttsVoiceId  = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined
 
-          const result = await generateAgentResponse({
+          // Stream LLM tokens → fire TTS on each sentence → send audio chunks immediately.
+          // This eliminates the full-response wait and starts audio ~150ms after first sentence.
+          const result = await streamAgentResponse({
             provider: llmProvider,
             apiKey: llmApiKey,
             model: llmModel,
@@ -167,15 +174,40 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
             }),
             conversationHistory,
             userMessage: transcript,
+            onSentence: async (sentence) => {
+              const current = activeSessions.get(callControlId)
+              if (!current?.ws || current.ws.readyState !== current.ws.OPEN) return
+              try {
+                const sentenceCost = await streamTextToSpeech({
+                  provider: ttsProvider,
+                  apiKey: ttsApiKey,
+                  voiceId: ttsVoiceId,
+                  text: sentence,
+                  onChunk: (base64Audio) => {
+                    const c = activeSessions.get(callControlId)
+                    if (c?.ws && c.ws.readyState === c.ws.OPEN) {
+                      c.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
+                    }
+                  },
+                })
+                data.costTts += sentenceCost
+              } catch (ttsErr) {
+                console.error(`[Pipeline] TTS stream error for sentence — ${ttsErr}`)
+              }
+            },
           })
           responseText = result.text
           data.costLlm += result.costUsd
           console.log(`[Cost] LLM +$${result.costUsd.toFixed(6)} (total LLM: $${data.costLlm.toFixed(6)})`)
+
+          // Transcript logged here — TTS was already sent sentence by sentence above
+          session.transcript.push({ role: 'agent', text: responseText, timestamp: new Date().toISOString() })
+          console.log(`[Pipeline] Agent: "${responseText}"`)
         } catch (llmError) {
           console.error(`[Pipeline] LLM error ${callControlId}:`, llmError)
           responseText = "Could you repeat that? I did not quite catch it."
+          await speakToProspect(callControlId, responseText)
         }
-        await speakToProspect(callControlId, responseText)
         break
     }
 
@@ -198,54 +230,37 @@ async function speakToProspect(callControlId: string, text: string) {
   if (!data) return
 
   const { session, ws, platformSettings } = data
-
   if (!platformSettings) return
 
-  session.transcript.push({
-    role: 'agent', text, timestamp: new Date().toISOString()
-  })
+  session.transcript.push({ role: 'agent', text, timestamp: new Date().toISOString() })
+  console.log(`[Pipeline] Agent: "${text}"`)
+
+  // Provider selection: agent field wins, falls back to global setting
+  const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'google'
+  const ttsApiKey   = ttsProvider === 'elevenlabs'
+    ? platformSettings.elevenlabs_api_key
+    : platformSettings.deepgram_api_key
 
   try {
-    console.log(`[Pipeline] Agent: "${text}"`)
-
-    // Provider selection: agent field wins, falls back to global setting
-    const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'google'
-    const ttsApiKey   = ttsProvider === 'elevenlabs'
-      ? platformSettings.elevenlabs_api_key
-      : platformSettings.deepgram_api_key
-
-    let ttsResult: { audio: string; costUsd: number }
-    try {
-      ttsResult = await textToSpeech({
-        provider: ttsProvider,
-        apiKey: ttsApiKey,
-        voiceId: ttsProvider === 'elevenlabs'
-          ? platformSettings.elevenlabs_voice_id
-          : undefined,
-        text,
-      })
-      data.costTts += ttsResult.costUsd
-      console.log(`[Cost] TTS +$${ttsResult.costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
-    } catch (ttsError) {
-      const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
-      console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
-      // End the call immediately — the prospect would hear silence otherwise
-      endSession(callControlId, 'error')
-      return
-    }
-
-    // Send TTS audio back to caller via WebSocket (bidirectional mode: mp3)
-    // Telnyx spec: { event: 'media', media: { payload: <base64 mp3> } }
-    if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({
-        event: 'media',
-        media: { payload: ttsResult.audio }
-      }))
-    } else {
-      console.warn(`[Pipeline] WebSocket not ready: ${callControlId}`)
-    }
-  } catch (error) {
-    console.error(`[Pipeline] speakToProspect error ${callControlId}:`, error)
+    // Stream TTS audio chunks to Telnyx as they arrive — no waiting for full MP3
+    const costUsd = await streamTextToSpeech({
+      provider: ttsProvider,
+      apiKey: ttsApiKey,
+      voiceId: ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined,
+      text,
+      onChunk: (base64Audio) => {
+        if (ws && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
+        }
+      },
+    })
+    data.costTts += costUsd
+    console.log(`[Cost] TTS +$${costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
+  } catch (ttsError) {
+    const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
+    console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
+    // End the call immediately — the prospect would hear silence otherwise
+    endSession(callControlId, 'error')
   }
 }
 
