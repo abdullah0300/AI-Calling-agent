@@ -1,7 +1,8 @@
 export interface TTSConfig {
   provider: 'elevenlabs' | 'deepgram' | 'google'
+  apiKey: string
+  voiceId?: string   // ElevenLabs voice ID or Deepgram voice model
   text: string
-  voiceId?: string
 }
 
 export interface TTSResult {
@@ -27,14 +28,14 @@ export async function textToSpeech(config: TTSConfig): Promise<TTSResult> {
 }
 
 async function elevenLabsTTS(config: TTSConfig): Promise<TTSResult> {
-  const voiceId = config.voiceId || process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'
+  const voiceId = config.voiceId || '21m00Tcm4TlvDq8ikWAM'
 
   const response = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
     {
       method: 'POST',
       headers: {
-        'xi-api-key': process.env.ELEVENLABS_API_KEY!,
+        'xi-api-key': config.apiKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -64,12 +65,12 @@ async function elevenLabsTTS(config: TTSConfig): Promise<TTSResult> {
 }
 
 async function deepgramTTS(config: TTSConfig): Promise<TTSResult> {
-  const voice = process.env.DEEPGRAM_TTS_VOICE || 'aura-asteria-en'
+  const voice = config.voiceId || 'aura-asteria-en'
   const response = await fetch(
     `https://api.deepgram.com/v1/speak?model=${voice}&encoding=mp3`,
     {
       method: 'POST',
-      headers: { 'Authorization': `Token ${process.env.DEEPGRAM_API_KEY!}`, 'Content-Type': 'application/json' },
+      headers: { 'Authorization': `Token ${config.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: config.text }),
     }
   )

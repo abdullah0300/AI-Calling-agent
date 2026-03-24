@@ -61,15 +61,29 @@ export async function POST(req: NextRequest) {
     // Used so Telnyx (external) can reach the WebSocket and webhook endpoints
     const wsPublicUrl = process.env.WS_PUBLIC_URL!
 
+    // Fetch Telnyx credentials from settings table (set via the Settings page)
+    // Falls back to env vars so existing setups without DB keys still work
+    const { data: settingsRows } = await supabase
+      .from('settings')
+      .select('key, value')
+      .in('key', ['telnyx_api_key', 'telnyx_connection_id'])
+    const settingsMap = Object.fromEntries((settingsRows || []).map(r => [r.key, r.value]))
+    const telnyxApiKey       = settingsMap.telnyx_api_key       || process.env.TELNYX_API_KEY       || ''
+    const telnyxConnectionId = settingsMap.telnyx_connection_id || process.env.TELNYX_CONNECTION_ID || ''
+
+    if (!telnyxApiKey || !telnyxConnectionId) {
+      return NextResponse.json({ error: 'Telnyx API key and Connection ID are required. Add them in Settings.' }, { status: 500 })
+    }
+
     // Initiate Telnyx outbound call
     const telnyxRes = await fetch('https://api.telnyx.com/v2/calls', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.TELNYX_API_KEY!}`,
+        'Authorization': `Bearer ${telnyxApiKey}`,
       },
       body: JSON.stringify({
-        connection_id: process.env.TELNYX_CONNECTION_ID,
+        connection_id: telnyxConnectionId,
         to: lead.phone_number,
         from: phoneNumber.number,
         client_state: Buffer.from(JSON.stringify({ callId: callRecord.id })).toString('base64'),
