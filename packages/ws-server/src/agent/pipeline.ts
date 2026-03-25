@@ -24,6 +24,8 @@ interface ActiveSession {
   costLlm: number
   costTts: number
   sttAudioBytes: number  // raw bytes sent to Deepgram — converted to cost at endSession
+  // Latency measurements: ms from STT final transcript → first audio chunk sent, per turn
+  latencyMeasurements: number[]
   // Platform settings loaded from DB at session start
   // API keys + global provider defaults, merged with per-agent overrides
   platformSettings: PlatformSettings | null
@@ -35,7 +37,7 @@ export function registerSession(callControlId: string, session: CallSession) {
   activeSessions.set(callControlId, {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
-    costLlm: 0, costTts: 0, sttAudioBytes: 0, platformSettings: null,
+    costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -105,6 +107,17 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   if (!data || data.isProcessing) return
 
   data.isProcessing = true
+  const turnStart = Date.now()
+  let firstChunkSent = false
+
+  // Called on the first audio chunk of each turn — measures STT final → first audio out.
+  const onFirstChunk = () => {
+    if (firstChunkSent) return
+    firstChunkSent = true
+    const latency = Date.now() - turnStart
+    data.latencyMeasurements.push(latency)
+    console.log(`[Latency] Turn response: ${latency}ms`)
+  }
 
   try {
     const { session, conversationHistory, platformSettings } = data
@@ -127,24 +140,24 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
 
       case 'not_interested':
         responseText = session.agent.not_interested_message
-        await speakToProspect(callControlId, responseText)
+        await speakToProspect(callControlId, responseText, onFirstChunk)
         setTimeout(() => endSession(callControlId, 'not_interested'), 4000)
         return
 
       case 'interested':
         responseText = session.agent.interest_detected_message
-        await speakToProspect(callControlId, responseText)
+        await speakToProspect(callControlId, responseText, onFirstChunk)
         setTimeout(() => endSession(callControlId, 'interested'), 6000)
         return
 
       case 'wrong_person':
         responseText = session.agent.wrong_person_message
-        await speakToProspect(callControlId, responseText)
+        await speakToProspect(callControlId, responseText, onFirstChunk)
         break
 
       case 'callback_request':
         responseText = session.agent.callback_message
-        await speakToProspect(callControlId, responseText)
+        await speakToProspect(callControlId, responseText, onFirstChunk)
         break
 
       default:
@@ -184,6 +197,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                   voiceId: ttsVoiceId,
                   text: sentence,
                   onChunk: (base64Audio) => {
+                    onFirstChunk()
                     const c = activeSessions.get(callControlId)
                     if (c?.ws && c.ws.readyState === c.ws.OPEN) {
                       c.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
@@ -225,7 +239,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   }
 }
 
-async function speakToProspect(callControlId: string, text: string) {
+async function speakToProspect(callControlId: string, text: string, onFirstChunk?: () => void) {
   const data = activeSessions.get(callControlId)
   if (!data) return
 
@@ -249,6 +263,7 @@ async function speakToProspect(callControlId: string, text: string) {
       voiceId: ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined,
       text,
       onChunk: (base64Audio) => {
+        onFirstChunk?.()
         if (ws && ws.readyState === ws.OPEN) {
           ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
         }
@@ -289,6 +304,13 @@ export async function endSession(callControlId: string, outcome: string) {
   const costTotal = data.costLlm + data.costTts + costStt
 
   console.log(`[Cost] Call ${callControlId} — LLM: $${data.costLlm.toFixed(6)} | TTS: $${data.costTts.toFixed(6)} | STT: $${costStt.toFixed(6)} | Total (excl. telephony): $${costTotal.toFixed(6)}`)
+
+  if (data.latencyMeasurements.length > 0) {
+    const avg = Math.round(data.latencyMeasurements.reduce((a, b) => a + b, 0) / data.latencyMeasurements.length)
+    const min = Math.min(...data.latencyMeasurements)
+    const max = Math.max(...data.latencyMeasurements)
+    console.log(`[Latency] Call ${callControlId} — avg: ${avg}ms | min: ${min}ms | max: ${max}ms | turns measured: ${data.latencyMeasurements.length}`)
+  }
 
   const leadStatus =
     outcome === 'interested' ? 'interested' :
