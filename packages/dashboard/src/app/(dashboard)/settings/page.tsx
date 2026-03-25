@@ -53,8 +53,20 @@ const providerConfig = [
     iconColor: 'text-violet-600',
     description: "Transcribes the prospect's speech in real-time.",
     options: [
-      { value: 'deepgram', label: 'Deepgram Nova-3', note: 'Recommended · fast & accurate' },
+      { value: 'deepgram', label: 'Deepgram', note: 'Recommended · fast & accurate' },
       { value: 'google',   label: 'Google STT',      note: 'Alternative' },
+    ],
+  },
+  {
+    key: 'active_stt_model',
+    label: 'Deepgram STT Model',
+    icon: Mic,
+    iconBg: 'bg-violet-100',
+    iconColor: 'text-violet-600',
+    description: 'nova-2 works on all plans. nova-3 is the latest but requires a paid plan.',
+    options: [
+      { value: 'nova-2', label: 'Nova 2', note: 'Recommended · available on all plans' },
+      { value: 'nova-3', label: 'Nova 3', note: 'Latest · requires paid Deepgram plan' },
     ],
   },
   {

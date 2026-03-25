@@ -3,6 +3,7 @@ import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk'
 export interface STTStreamConfig {
   provider: 'deepgram' | 'google'
   apiKey: string
+  model?: string  // e.g. 'nova-2', 'nova-3' — defaults to 'nova-2'
   onTranscript: (text: string, isFinal: boolean) => void
   onError: (error: Error) => void
 }
@@ -16,7 +17,7 @@ function createDeepgramStream(config: STTStreamConfig) {
   const deepgram = createClient(config.apiKey)
 
   const connection = deepgram.listen.live({
-    model: 'nova-3',
+    model: (config.model || 'nova-2') as any,
     language: 'en-GB',
     smart_format: true,
     interim_results: true,
@@ -43,7 +44,8 @@ function createDeepgramStream(config: STTStreamConfig) {
   })
 
   connection.on(LiveTranscriptionEvents.Error, (error: any) => {
-    config.onError(new Error(String(error)))
+    const msg = error?.message || error?.reason || error?.code || JSON.stringify(error) || String(error)
+    config.onError(new Error(`Deepgram WS error: ${msg}`))
   })
 
   // CRITICAL: Send keepalive every 10 seconds

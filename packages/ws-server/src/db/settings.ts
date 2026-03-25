@@ -5,6 +5,7 @@ export interface PlatformSettings {
   active_llm: string
   active_llm_model: string
   active_stt: string
+  active_stt_model: string
   active_tts: string
   active_telephony: string
   // API keys — stored in settings table, managed via the Settings page
@@ -29,6 +30,7 @@ export async function loadSettings(): Promise<PlatformSettings> {
     active_llm:           map.active_llm           || 'anthropic',
     active_llm_model:     map.active_llm_model     || 'claude-haiku-4-5',
     active_stt:           map.active_stt           || 'deepgram',
+    active_stt_model:     map.active_stt_model     || 'nova-2',
     active_tts:           map.active_tts           || 'elevenlabs',
     active_telephony:     map.active_telephony     || 'telnyx',
     anthropic_api_key:    map.anthropic_api_key    || process.env.ANTHROPIC_API_KEY    || '',
