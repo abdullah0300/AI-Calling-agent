@@ -84,6 +84,7 @@ export async function startSession(callControlId: string) {
   data.sttStream = createSTTStream({
     provider: sttProvider,
     apiKey: platformSettings.deepgram_api_key,
+    model: platformSettings.active_stt_model,
     onTranscript: async (text, isFinal) => {
       if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
     },
