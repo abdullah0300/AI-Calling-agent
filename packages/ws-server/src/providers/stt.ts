@@ -43,7 +43,7 @@ function createDeepgramStream(config: STTStreamConfig) {
 
   const connection = deepgram.listen.live({
     model: model as any,
-    language: 'en',
+    language: 'en-GB',
     smart_format: true,
     interim_results: true,
     utterance_end_ms: 500,

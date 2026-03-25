@@ -65,8 +65,8 @@ const providerConfig = [
     iconColor: 'text-violet-600',
     description: 'nova-2 works on all plans. nova-3 is the latest but requires a paid plan.',
     options: [
-      { value: 'nova-2', label: 'Nova 2', note: 'Recommended · available on all plans' },
-      { value: 'nova-3', label: 'Nova 3', note: 'Latest · requires paid Deepgram plan' },
+      { value: 'nova-3', label: 'Nova 3', note: 'Recommended · best accuracy' },
+      { value: 'nova-2', label: 'Nova 2', note: 'Fallback option' },
     ],
   },
   {
