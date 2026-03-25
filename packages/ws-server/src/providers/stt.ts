@@ -24,11 +24,26 @@ function createDeepgramStream(config: STTStreamConfig) {
   const model = config.model || 'nova-2'
   console.log(`[STT] Connecting to Deepgram — model: ${model}, key: ${keyPreview}`)
 
+  // Quick auth check — surfaces exact HTTP status before attempting WebSocket
+  fetch('https://api.deepgram.com/v1/projects', {
+    headers: { Authorization: `Token ${config.apiKey}` },
+  }).then(r => {
+    if (r.ok) {
+      console.log('[STT] Deepgram key valid — HTTP 200 OK')
+    } else {
+      console.error(`[STT] Deepgram key check failed — HTTP ${r.status}. ${
+        r.status === 401 ? 'Invalid or expired API key.' :
+        r.status === 402 ? 'Account has no credits / payment required.' :
+        r.status === 403 ? 'Key lacks permission for live streaming.' : ''
+      } Go to console.deepgram.com to fix.`)
+    }
+  }).catch(() => { /* ignore — network errors handled by WS below */ })
+
   const deepgram = createClient(config.apiKey)
 
   const connection = deepgram.listen.live({
     model: model as any,
-    language: 'en-GB',
+    language: 'en',
     smart_format: true,
     interim_results: true,
     utterance_end_ms: 500,
