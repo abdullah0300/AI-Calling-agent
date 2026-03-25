@@ -14,10 +14,20 @@ export function createSTTStream(config: STTStreamConfig) {
 }
 
 function createDeepgramStream(config: STTStreamConfig) {
+  if (!config.apiKey) {
+    console.error('[STT] Deepgram API key is empty — check Settings → Deepgram API Key')
+    config.onError(new Error('Deepgram API key is not set'))
+    return { sendAudio: () => {}, close: () => {} }
+  }
+
+  const keyPreview = config.apiKey.slice(0, 8) + '…'
+  const model = config.model || 'nova-2'
+  console.log(`[STT] Connecting to Deepgram — model: ${model}, key: ${keyPreview}`)
+
   const deepgram = createClient(config.apiKey)
 
   const connection = deepgram.listen.live({
-    model: (config.model || 'nova-2') as any,
+    model: model as any,
     language: 'en-GB',
     smart_format: true,
     interim_results: true,
@@ -46,6 +56,19 @@ function createDeepgramStream(config: STTStreamConfig) {
   connection.on(LiveTranscriptionEvents.Error, (error: any) => {
     const msg = error?.message || error?.reason || error?.code || JSON.stringify(error) || String(error)
     config.onError(new Error(`Deepgram WS error: ${msg}`))
+  })
+
+  // Close event carries the HTTP status code — useful for diagnosing 401/402/403
+  connection.on(LiveTranscriptionEvents.Close, (event: any) => {
+    const code = event?.code
+    const reason = event?.reason || ''
+    if (code && code !== 1000) {
+      if (code === 1008 || reason.toLowerCase().includes('auth') || reason.toLowerCase().includes('key')) {
+        console.error(`[STT] Deepgram rejected connection — invalid API key (code ${code}): ${reason}`)
+      } else {
+        console.warn(`[STT] Deepgram connection closed — code ${code}: ${reason}`)
+      }
+    }
   })
 
   // CRITICAL: Send keepalive every 10 seconds
