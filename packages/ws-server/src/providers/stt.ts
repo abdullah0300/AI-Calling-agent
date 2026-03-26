@@ -1,17 +1,121 @@
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk'
+import WebSocket from 'ws'
 
 export interface STTStreamConfig {
   provider: 'deepgram' | 'google'
   apiKey: string
-  model?: string  // e.g. 'nova-2', 'nova-3' — defaults to 'nova-2'
+  model?: string  // e.g. 'nova-2', 'nova-3', 'nova-2-phonecall', 'flux' — defaults to 'nova-3'
   onTranscript: (text: string, isFinal: boolean) => void
   onError: (error: Error) => void
   onSpeechStarted?: () => void  // fires when Deepgram detects the prospect starting to speak (used for barge-in)
 }
 
 export function createSTTStream(config: STTStreamConfig) {
-  if (config.provider === 'deepgram') return createDeepgramStream(config)
-  throw new Error(`STT provider ${config.provider} not yet implemented`)
+  if (config.provider !== 'deepgram') throw new Error(`STT provider ${config.provider} not yet implemented`)
+  // Flux uses Deepgram's v2 WebSocket API — completely separate from the v1 SDK path
+  if (config.model === 'flux') return createFluxStream(config)
+  return createDeepgramStream(config)
+}
+
+// ─── G.711 μ-law → linear16 PCM converter ───────────────────────────────────
+// Telnyx streams mulaw 8kHz. Deepgram Flux only accepts linear16.
+// Each mulaw byte expands to one 16-bit LE PCM sample.
+function mulawToLinear16(mulaw: Buffer): Buffer {
+  const out = Buffer.alloc(mulaw.length * 2)
+  for (let i = 0; i < mulaw.length; i++) {
+    let b = (~mulaw[i]) & 0xFF
+    const sign      = b & 0x80
+    const exponent  = (b >> 4) & 0x07
+    const mantissa  = b & 0x0F
+    let sample      = ((mantissa << 3) | 0x84) << exponent
+    sample         -= 0x84
+    if (sign) sample = -sample
+    sample = Math.max(-32768, Math.min(32767, sample))
+    out.writeInt16LE(sample, i * 2)
+  }
+  return out
+}
+
+// ─── Deepgram Flux (v2/listen) ───────────────────────────────────────────────
+// Uses raw WebSocket because SDK v3 only supports v1/listen.
+// Flux replaces our manual VAD/endpointing with model-native turn detection:
+//   EndOfTurn  → onTranscript(text, true)   — equivalent to speech_final
+//   StartOfTurn → onSpeechStarted()         — equivalent to SpeechStarted (barge-in)
+function createFluxStream(config: STTStreamConfig) {
+  if (!config.apiKey) {
+    config.onError(new Error('Deepgram API key is not set'))
+    return { sendAudio: () => {}, close: () => {} }
+  }
+
+  const params = new URLSearchParams({
+    model:          'flux-general-en',
+    encoding:       'linear16',
+    sample_rate:    '8000',
+    eot_timeout_ms: '1500',   // fallback silence timeout — 1.5s is good for voice agents
+    eot_threshold:  '0.7',    // default confidence required to fire EndOfTurn
+  })
+  const url = `wss://api.deepgram.com/v2/listen?${params}`
+  const keyPreview = config.apiKey.slice(0, 8) + '…'
+  console.log(`[STT/Flux] Connecting — key: ${keyPreview}`)
+
+  const ws = new WebSocket(url, { headers: { Authorization: `Token ${config.apiKey}` } })
+
+  ws.on('open', () => {
+    console.log('[STT/Flux] Connected to Deepgram v2/listen')
+  })
+
+  ws.on('message', (raw: Buffer) => {
+    let msg: any
+    try { msg = JSON.parse(raw.toString()) } catch { return }
+
+    if (msg.type !== 'TurnInfo') return  // ignore Connected/Metadata/etc.
+
+    const event = msg.event as string
+    const transcript = (msg.transcript as string | undefined)?.trim()
+
+    if (event === 'EndOfTurn' && transcript && transcript.length > 2) {
+      // Final transcript — send to LLM pipeline
+      config.onTranscript(transcript, true)
+    } else if (event === 'StartOfTurn') {
+      // Prospect started speaking — trigger barge-in if agent is speaking
+      config.onSpeechStarted?.()
+    }
+    // Update events (interim) and EagerEndOfTurn are ignored for now
+  })
+
+  ws.on('error', (err: Error) => {
+    console.error('[STT/Flux] WebSocket error:', err.message)
+    config.onError(new Error(`Deepgram Flux WS error: ${err.message}`))
+  })
+
+  ws.on('close', (code: number, reason: Buffer) => {
+    const r = reason?.toString() || ''
+    if (code !== 1000) {
+      if (code === 1008 || r.toLowerCase().includes('auth') || r.toLowerCase().includes('key')) {
+        console.error(`[STT/Flux] Rejected — invalid API key (code ${code}): ${r}`)
+      } else {
+        console.warn(`[STT/Flux] Closed — code ${code}: ${r}`)
+      }
+    }
+  })
+
+  // Ping every 10 seconds to keep the connection alive during prospect silence
+  const keepAlive = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping()
+  }, 10000)
+
+  return {
+    sendAudio: (chunk: Buffer) => {
+      if (ws.readyState !== WebSocket.OPEN) return
+      // Flux requires linear16 — convert from mulaw before sending
+      const linear16 = mulawToLinear16(chunk)
+      ws.send(linear16)
+    },
+    close: () => {
+      clearInterval(keepAlive)
+      if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'session ended')
+    },
+  }
 }
 
 function createDeepgramStream(config: STTStreamConfig) {

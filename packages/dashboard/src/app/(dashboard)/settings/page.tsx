@@ -63,8 +63,9 @@ const providerConfig = [
     icon: Mic,
     iconBg: 'bg-violet-100',
     iconColor: 'text-violet-600',
-    description: 'nova-3 is the default. nova-2-phonecall is tuned for low-bandwidth phone audio.',
+    description: 'Flux is the newest voice-agent model with built-in turn detection. Nova 3 is the accurate general model.',
     options: [
+      { value: 'flux',             label: 'Flux',              note: 'New · voice-agent optimised' },
       { value: 'nova-3',           label: 'Nova 3',            note: 'Recommended · best accuracy' },
       { value: 'nova-2-phonecall', label: 'Nova 2 Phonecall',  note: 'Phone-optimised · low bandwidth' },
       { value: 'nova-2',           label: 'Nova 2',            note: 'Stable fallback' },
