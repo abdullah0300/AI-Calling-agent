@@ -29,22 +29,41 @@ export interface LLMStreamConfig extends LLMConfig {
   onSentence: (sentence: string) => Promise<void>
 }
 
-// Splits buffered text into complete sentences (ending with . ! ?) and a remainder.
+// Splits buffered LLM token stream into speakable chunks.
+// Primary split: sentence-ending punctuation (. ! ?)
+// Early-flush split: comma or em-dash after ≥6 words — starts TTS on the first natural
+// clause without waiting for the full sentence. Critical for low latency.
 function extractSentences(buffer: string): { sentences: string[]; remainder: string } {
   const sentences: string[] = []
   let start = 0
+
   for (let i = 0; i < buffer.length; i++) {
     const ch = buffer[i]
-    if (ch === '.' || ch === '!' || ch === '?') {
-      const next = buffer[i + 1]
-      if (next === undefined || next === ' ' || next === '\n') {
-        const sentence = buffer.slice(start, i + 1).trim()
-        if (sentence.length > 3) sentences.push(sentence)
-        start = i + (next === ' ' || next === '\n' ? 2 : 1)
+    const next = buffer[i + 1]
+
+    // Hard sentence boundary — always split here
+    if ((ch === '.' || ch === '!' || ch === '?') &&
+        (next === undefined || next === ' ' || next === '\n')) {
+      const chunk = buffer.slice(start, i + 1).trim()
+      if (chunk.length > 3) sentences.push(chunk)
+      start = i + (next === ' ' || next === '\n' ? 2 : 1)
+      i = start - 1
+      continue
+    }
+
+    // Soft clause boundary — split on comma or em-dash, but only after ≥6 words.
+    // This fires TTS on the first short clause so audio starts ~150ms sooner.
+    if (ch === ',' || (ch === '—') || (ch === '-' && next === ' ')) {
+      const candidate = buffer.slice(start, i + 1).trim()
+      const wordCount = candidate.split(/\s+/).length
+      if (wordCount >= 6) {
+        sentences.push(candidate)
+        start = i + 2  // skip the comma/dash + following space
         i = start - 1
       }
     }
   }
+
   return { sentences, remainder: buffer.slice(start) }
 }
 
@@ -55,7 +74,7 @@ export async function streamAgentResponse(config: LLMStreamConfig): Promise<LLMR
     const client = new Anthropic({ apiKey: config.apiKey })
     const stream = client.messages.stream({
       model: config.model,
-      max_tokens: 150,
+      max_tokens: 110,  // 110 tokens ≈ 40 words with headroom — avoids mid-sentence cuts while keeping responses short
       system: config.systemPrompt,
       messages: [
         ...config.conversationHistory,
@@ -95,7 +114,7 @@ export async function streamAgentResponse(config: LLMStreamConfig): Promise<LLMR
   const client = new OpenAI({ apiKey: config.apiKey })
   const stream = await client.chat.completions.create({
     model: config.model,
-    max_tokens: 150,
+    max_tokens: 110,  // match Anthropic — avoids mid-sentence cuts
     stream: true,
     stream_options: { include_usage: true },
     messages: [
