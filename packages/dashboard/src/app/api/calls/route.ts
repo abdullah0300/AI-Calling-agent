@@ -39,9 +39,10 @@ export async function POST(req: NextRequest) {
     const phoneNumber = phoneRes.data
 
     // Prevent duplicate active calls for same lead
+    // .maybeSingle() returns null (not an error) when no row found — .single() would throw 406
     const { data: existingCall } = await supabase
       .from('calls').select('id')
-      .eq('lead_id', leadId).eq('status', 'in_progress').single()
+      .eq('lead_id', leadId).eq('status', 'in_progress').maybeSingle()
 
     if (existingCall) {
       return NextResponse.json({ error: 'Lead already has active call' }, { status: 409 })
@@ -56,10 +57,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Could not create call record' }, { status: 500 })
     }
 
-    const wsServerUrl = process.env.WS_SERVER_URL!
-    // WS_PUBLIC_URL is the ngrok/public HTTPS URL of the ws-server
-    // Used so Telnyx (external) can reach the WebSocket and webhook endpoints
-    const wsPublicUrl = process.env.WS_PUBLIC_URL!
+    const wsServerUrl = process.env.WS_SERVER_URL
+    const wsPublicUrl = process.env.WS_PUBLIC_URL
+
+    if (!wsServerUrl || !wsPublicUrl) {
+      return NextResponse.json(
+        { error: 'WS_SERVER_URL and WS_PUBLIC_URL environment variables must be set.' },
+        { status: 500 }
+      )
+    }
 
     // Fetch Telnyx credentials from settings table (set via the Settings page)
     // Falls back to env vars so existing setups without DB keys still work
