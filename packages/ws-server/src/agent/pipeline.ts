@@ -36,6 +36,9 @@ interface ActiveSession {
   bargedIn: boolean
   // Telnyx stream_id from the WS 'start' event — required to send the 'clear' command
   telnyxStreamId: string | null
+  // Mark name sent to Telnyx after last audio chunk — isSpeaking stays true until Telnyx echoes it back,
+  // which signals that audio playback has actually finished on the call (not just that we finished fetching).
+  pendingMarkId: string | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -45,7 +48,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
-    isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
+    isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null, pendingMarkId: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -109,6 +112,7 @@ export async function startSession(callControlId: string) {
       d.currentTtsAbort?.abort()
       d.currentTtsAbort = null
       d.isSpeaking = false
+      d.pendingMarkId = null  // Telnyx will echo this back after clear — already handled
       d.isProcessing = false  // allow new speech turn to start immediately
       // CRITICAL: tell Telnyx to discard all buffered audio immediately.
       // Without this, audio already queued in Telnyx's playback buffer keeps
@@ -225,6 +229,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
               if (current.bargedIn) return  // prospect interrupted — skip remaining sentences
 
               const sentenceAbort = new AbortController()
+              const sentenceMarkId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
               current.currentTtsAbort = sentenceAbort
               current.isSpeaking = true
               try {
@@ -243,12 +248,27 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                   },
                 })
                 data.costTts += sentenceCost
+                // Send mark after all audio for this sentence — Telnyx echoes when done playing.
+                // For multi-sentence responses, only the last mark matters: each sentence overwrites
+                // pendingMarkId, so only the last sentence's mark triggers isSpeaking = false.
+                const c = activeSessions.get(callControlId)
+                if (c?.ws && c.ws.readyState === c.ws.OPEN) {
+                  c.pendingMarkId = sentenceMarkId
+                  c.ws.send(JSON.stringify({ event: 'mark', stream_id: c.telnyxStreamId, mark: { name: sentenceMarkId } }))
+                }
               } catch (ttsErr) {
-                console.error(`[Pipeline] TTS stream error for sentence — ${ttsErr}`)
+                if (!(ttsErr instanceof Error && ttsErr.name === 'AbortError')) {
+                  console.error(`[Pipeline] TTS stream error for sentence — ${ttsErr}`)
+                }
+                // On error/abort, clear speaking state since no mark will return for this sentence
+                if (current.currentTtsAbort === sentenceAbort) {
+                  current.isSpeaking = false
+                  current.pendingMarkId = null
+                }
               } finally {
                 if (current.currentTtsAbort === sentenceAbort) {
                   current.currentTtsAbort = null
-                  current.isSpeaking = false
+                  // isSpeaking intentionally NOT cleared here — onTelnyxMark() handles it
                 }
               }
             },
@@ -299,6 +319,7 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
     : platformSettings.deepgram_api_key
 
   const abortController = new AbortController()
+  const markId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   data.currentTtsAbort = abortController
   data.isSpeaking = true
 
@@ -319,6 +340,13 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
     })
     data.costTts += costUsd
     console.log(`[Cost] TTS +$${costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
+    // All audio bytes sent to Telnyx — but Telnyx hasn't finished playing yet.
+    // Send a mark: Telnyx echoes it back when the last audio chunk finishes playing.
+    // isSpeaking stays true until onTelnyxMark() fires — this is the core barge-in fix.
+    if (ws && ws.readyState === ws.OPEN) {
+      data.pendingMarkId = markId
+      ws.send(JSON.stringify({ event: 'mark', stream_id: data.telnyxStreamId, mark: { name: markId } }))
+    }
   } catch (ttsError) {
     if (ttsError instanceof Error && ttsError.name === 'AbortError') {
       console.log(`[Pipeline] TTS aborted (barge-in) ${callControlId}`)
@@ -326,12 +354,15 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
     }
     const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
     console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
+    // Clear speaking state since no mark will come back
+    data.isSpeaking = false
+    data.pendingMarkId = null
     // End the call immediately — the prospect would hear silence otherwise
     endSession(callControlId, 'error')
   } finally {
     if (data.currentTtsAbort === abortController) {
       data.currentTtsAbort = null
-      data.isSpeaking = false
+      // isSpeaking intentionally NOT cleared here — onTelnyxMark() clears it when Telnyx finishes playing
     }
   }
 }
@@ -391,6 +422,18 @@ export async function endSession(callControlId: string, outcome: string) {
   ])
 
   console.log(`[Pipeline] Session cleaned up: ${callControlId}`)
+}
+
+// Called from index.ts when Telnyx echoes back a mark — signals true end of audio playback on the call.
+// This is how we know the prospect can hear silence and barge-in window is actually over.
+export function onTelnyxMark(callControlId: string, markName: string) {
+  const d = activeSessions.get(callControlId)
+  if (!d) return
+  if (d.pendingMarkId === markName) {
+    d.pendingMarkId = null
+    d.isSpeaking = false
+    console.log(`[Pipeline] Telnyx playback complete — mark: ${markName}`)
+  }
 }
 
 // Called from index.ts when Telnyx call.cost webhook arrives
