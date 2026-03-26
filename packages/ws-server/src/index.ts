@@ -103,9 +103,11 @@ wss.on('connection', (ws: WebSocket) => {
 
         case 'start':
           callControlId = message.start?.call_control_id || message.stream_id || null
+          // stream_id is needed later to send Telnyx 'clear' on barge-in
+          const streamId: string | undefined = message.stream_id
           console.log(`[WS] Audio stream started: ${callControlId}`)
           if (callControlId) {
-            attachWebSocket(callControlId, ws)
+            attachWebSocket(callControlId, ws, streamId)
             // Start session here — AFTER WebSocket is attached — so greeting audio
             // can be sent immediately. Starting from the webhook risks ws being null.
             await startSession(callControlId)

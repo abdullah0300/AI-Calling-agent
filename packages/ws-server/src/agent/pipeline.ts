@@ -34,6 +34,8 @@ interface ActiveSession {
   currentTtsAbort: AbortController | null
   // Set to true when barge-in fires mid-LLM-stream — onSentence skips remaining sentences
   bargedIn: boolean
+  // Telnyx stream_id from the WS 'start' event — required to send the 'clear' command
+  telnyxStreamId: string | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -43,16 +45,17 @@ export function registerSession(callControlId: string, session: CallSession) {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
-    isSpeaking: false, currentTtsAbort: null, bargedIn: false,
+    isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
 
-export function attachWebSocket(callControlId: string, ws: WebSocket) {
+export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?: string) {
   const data = activeSessions.get(callControlId)
   if (data) {
     data.ws = ws
-    console.log(`[Pipeline] WebSocket attached: ${callControlId}`)
+    data.telnyxStreamId = streamId || null
+    console.log(`[Pipeline] WebSocket attached: ${callControlId} (stream_id: ${streamId ?? 'n/a'})`)
   }
 }
 
@@ -107,6 +110,14 @@ export async function startSession(callControlId: string) {
       d.currentTtsAbort = null
       d.isSpeaking = false
       d.isProcessing = false  // allow new speech turn to start immediately
+      // CRITICAL: tell Telnyx to discard all buffered audio immediately.
+      // Without this, audio already queued in Telnyx's playback buffer keeps
+      // playing even after we stop sending new chunks — the prospect hears the
+      // full sentence regardless of interruption.
+      if (d.ws && d.ws.readyState === d.ws.OPEN) {
+        d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
+        console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
+      }
     },
   })
 
