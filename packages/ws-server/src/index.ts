@@ -4,7 +4,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { createServer } from 'http'
 import {
   activeSessions, registerSession, attachWebSocket,
-  startSession, handleAudioChunk, endSession, updateTelephonyCost
+  startSession, handleAudioChunk, endSession, updateTelephonyCost, onTelnyxMark
 } from './agent/pipeline'
 import type { CallSession } from '@voiceflow/shared'
 
@@ -118,6 +118,14 @@ wss.on('connection', (ws: WebSocket) => {
           if (callControlId && message.media?.payload) {
             const audioBuffer = Buffer.from(message.media.payload, 'base64')
             await handleAudioChunk(callControlId, audioBuffer)
+          }
+          break
+
+        case 'mark':
+          // Telnyx echoes a mark back when all audio before it has finished playing.
+          // This is how we track true playback completion for the isSpeaking flag.
+          if (callControlId && message.mark?.name) {
+            onTelnyxMark(callControlId, message.mark.name)
           }
           break
 

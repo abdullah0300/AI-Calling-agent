@@ -151,7 +151,6 @@ function createDeepgramStream(config: STTStreamConfig) {
     language: 'en-GB',
     smart_format: true,
     interim_results: true,
-    utterance_end_ms: 500,
     vad_events: true,
     endpointing: 300,
     // CRITICAL: Telnyx streams mulaw 8000Hz mono audio
