@@ -51,7 +51,9 @@ async function elevenLabsStreamingTTS(config: TTSStreamConfig): Promise<number> 
           text: config.text,
           model_id: 'eleven_flash_v2_5',
           voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0.15, use_speaker_boost: true },
-          output_format: 'mp3_44100_128',
+          // mp3_22050_32: phone-grade quality (Telnyx resamples to 8kHz anyway), ~4x smaller
+          // than mp3_44100_128 — less data to transfer and less transcoding overhead for Telnyx
+          output_format: 'mp3_22050_32',
           optimize_streaming_latency: 4,
         }),
         signal: config.abortSignal,

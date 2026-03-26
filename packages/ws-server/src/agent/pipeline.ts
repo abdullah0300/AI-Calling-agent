@@ -12,6 +12,31 @@ import type WebSocket from 'ws'
 // (source: deepgram.com/pricing)
 const DEEPGRAM_STT_PER_BYTE = 0.0077 / 60 / 8000  // $0.0077/min ÷ 60s ÷ 8000 bytes/s (mulaw 8kHz)
 
+// ─── Local VAD constants for fast barge-in ───────────────────────────────────
+// Vapi/LiveKit detect barge-in in ~80ms using raw audio energy (VAD), not by waiting
+// for the STT model to make a decision. We mirror this with a simple energy threshold.
+// Telnyx sends mulaw 8kHz. When decoded to linear16: silence ~0-200 RMS, noise ~200-600,
+// speech ~600-5000. We require sustained speech (150ms) above threshold to fire barge-in.
+const BARGE_IN_ENERGY_THRESHOLD = 600   // RMS of decoded linear16 — above this = likely speech
+const BARGE_IN_MIN_SPEECH_MS    = 150   // ms of sustained speech before triggering barge-in
+
+// Decodes a mulaw 8kHz buffer and returns its RMS energy (linear16 scale).
+// Used by local VAD to detect prospect speech during agent audio playback.
+function mulawRms(buf: Buffer): number {
+  let sumSq = 0
+  for (let i = 0; i < buf.length; i++) {
+    let b = (~buf[i]) & 0xFF
+    const sign = b & 0x80
+    const exp  = (b >> 4) & 0x07
+    const mant = b & 0x0F
+    let s = ((mant << 3) | 0x84) << exp
+    s -= 0x84
+    if (sign) s = -s
+    sumSq += s * s
+  }
+  return Math.sqrt(sumSq / buf.length)
+}
+
 interface ActiveSession {
   session: CallSession
   ws: WebSocket | null
@@ -36,9 +61,15 @@ interface ActiveSession {
   bargedIn: boolean
   // Telnyx stream_id from the WS 'start' event — required to send the 'clear' command
   telnyxStreamId: string | null
-  // Mark name sent to Telnyx after last audio chunk — isSpeaking stays true until Telnyx echoes it back,
-  // which signals that audio playback has actually finished on the call (not just that we finished fetching).
-  pendingMarkId: string | null
+  // SET of mark IDs sent to Telnyx that haven't been echoed back yet.
+  // Each sentence adds its markId BEFORE the TTS fetch starts — this prevents the race condition
+  // where sentence N's mark returns from Telnyx while sentence N+1's TTS is still fetching,
+  // which used to flip isSpeaking=false even though more audio was about to play.
+  // isSpeaking stays true as long as pendingMarkIds.size > 0.
+  pendingMarkIds: Set<string>
+  // Accumulated ms of audio above speech-energy threshold — for local VAD barge-in detection.
+  // Reset to 0 when energy drops below threshold or barge-in fires.
+  vadSpeechMs: number
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -48,7 +79,8 @@ export function registerSession(callControlId: string, session: CallSession) {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
-    isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null, pendingMarkId: null,
+    isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
+    pendingMarkIds: new Set<string>(), vadSpeechMs: 0,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -59,6 +91,25 @@ export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?:
     data.ws = ws
     data.telnyxStreamId = streamId || null
     console.log(`[Pipeline] WebSocket attached: ${callControlId} (stream_id: ${streamId ?? 'n/a'})`)
+  }
+}
+
+// Central barge-in handler — called by both the STT onSpeechStarted callback AND the local VAD.
+// Immediately stops TTS, clears all pending marks, and clears Telnyx's audio buffer.
+function fireBargeIn(callControlId: string): void {
+  const d = activeSessions.get(callControlId)
+  if (!d || !d.isSpeaking) return
+  console.log(`[Pipeline] Barge-in detected — aborting TTS ${callControlId}`)
+  d.bargedIn = true
+  d.currentTtsAbort?.abort()
+  d.currentTtsAbort = null
+  d.isSpeaking = false
+  d.pendingMarkIds.clear()
+  d.vadSpeechMs = 0
+  d.isProcessing = false  // allow new speech turn to start immediately
+  if (d.ws && d.ws.readyState === d.ws.OPEN) {
+    d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
+    console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
   }
 }
 
@@ -104,25 +155,10 @@ export async function startSession(callControlId: string) {
       if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
     },
     onError: (error) => console.error(`[Pipeline] STT error ${callControlId}:`, error),
-    onSpeechStarted: () => {
-      const d = activeSessions.get(callControlId)
-      if (!d || !d.isSpeaking) return
-      console.log(`[Pipeline] Barge-in detected — aborting TTS ${callControlId}`)
-      d.bargedIn = true
-      d.currentTtsAbort?.abort()
-      d.currentTtsAbort = null
-      d.isSpeaking = false
-      d.pendingMarkId = null  // Telnyx will echo this back after clear — already handled
-      d.isProcessing = false  // allow new speech turn to start immediately
-      // CRITICAL: tell Telnyx to discard all buffered audio immediately.
-      // Without this, audio already queued in Telnyx's playback buffer keeps
-      // playing even after we stop sending new chunks — the prospect hears the
-      // full sentence regardless of interruption.
-      if (d.ws && d.ws.readyState === d.ws.OPEN) {
-        d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
-        console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
-      }
-    },
+    // STT-based barge-in: Deepgram fires SpeechStarted (Nova-2) or StartOfTurn (Flux)
+    // when it detects the prospect starting to speak. We also run a parallel local VAD
+    // in handleAudioChunk for faster (~80ms) detection independent of the STT model.
+    onSpeechStarted: () => fireBargeIn(callControlId),
   })
 
   await speakToProspect(callControlId, session.agent.greeting_message)
@@ -135,6 +171,25 @@ export async function handleAudioChunk(callControlId: string, audioBuffer: Buffe
   // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
   data.sttAudioBytes += audioBuffer.length
   data.sttStream.sendAudio(audioBuffer)
+
+  // ── Local VAD barge-in (runs on every audio chunk while agent is speaking) ──
+  // Vapi/LiveKit detect interruptions in ~80ms via raw audio energy, not by waiting
+  // for the STT model to make a decision. This mirrors that approach.
+  // Only active when isSpeaking=true — no point running when agent is silent.
+  if (data.isSpeaking) {
+    const chunkMs = audioBuffer.length / 8  // 8000 bytes/s → 8 bytes per ms
+    if (mulawRms(audioBuffer) > BARGE_IN_ENERGY_THRESHOLD) {
+      data.vadSpeechMs += chunkMs
+      if (data.vadSpeechMs >= BARGE_IN_MIN_SPEECH_MS) {
+        data.vadSpeechMs = 0
+        fireBargeIn(callControlId)
+      }
+    } else {
+      data.vadSpeechMs = 0  // reset on silence — prevents cumulative noise triggering
+    }
+  } else {
+    data.vadSpeechMs = 0
+  }
 }
 
 async function handleProspectSpeech(callControlId: string, transcript: string) {
@@ -230,6 +285,11 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
 
               const sentenceAbort = new AbortController()
               const sentenceMarkId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+              // Add markId to the pending set BEFORE the TTS fetch starts.
+              // This prevents the race condition: sentence N's mark can return from Telnyx
+              // while sentence N+1's TTS is still fetching — with the Set, N+1 is already
+              // registered, so isSpeaking stays true until N+1's mark also returns.
+              current.pendingMarkIds.add(sentenceMarkId)
               current.currentTtsAbort = sentenceAbort
               current.isSpeaking = true
               try {
@@ -248,27 +308,24 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                   },
                 })
                 data.costTts += sentenceCost
-                // Send mark after all audio for this sentence — Telnyx echoes when done playing.
-                // For multi-sentence responses, only the last mark matters: each sentence overwrites
-                // pendingMarkId, so only the last sentence's mark triggers isSpeaking = false.
+                // Send mark to Telnyx — it will echo back when this sentence finishes playing
                 const c = activeSessions.get(callControlId)
                 if (c?.ws && c.ws.readyState === c.ws.OPEN) {
-                  c.pendingMarkId = sentenceMarkId
                   c.ws.send(JSON.stringify({ event: 'mark', stream_id: c.telnyxStreamId, mark: { name: sentenceMarkId } }))
                 }
               } catch (ttsErr) {
                 if (!(ttsErr instanceof Error && ttsErr.name === 'AbortError')) {
                   console.error(`[Pipeline] TTS stream error for sentence — ${ttsErr}`)
                 }
-                // On error/abort, clear speaking state since no mark will return for this sentence
+                // On abort (barge-in already cleared the set) or error — remove this mark
                 if (current.currentTtsAbort === sentenceAbort) {
-                  current.isSpeaking = false
-                  current.pendingMarkId = null
+                  current.pendingMarkIds.delete(sentenceMarkId)
+                  if (current.pendingMarkIds.size === 0) current.isSpeaking = false
                 }
               } finally {
                 if (current.currentTtsAbort === sentenceAbort) {
                   current.currentTtsAbort = null
-                  // isSpeaking intentionally NOT cleared here — onTelnyxMark() handles it
+                  // isSpeaking cleared by onTelnyxMark when all marks return
                 }
               }
             },
@@ -320,6 +377,9 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
 
   const abortController = new AbortController()
   const markId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  // Add markId BEFORE the TTS fetch — prevents race where Telnyx echoes an old mark
+  // back while this fetch is in-flight, which would clear isSpeaking prematurely.
+  data.pendingMarkIds.add(markId)
   data.currentTtsAbort = abortController
   data.isSpeaking = true
 
@@ -341,22 +401,21 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
     data.costTts += costUsd
     console.log(`[Cost] TTS +$${costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
     // All audio bytes sent to Telnyx — but Telnyx hasn't finished playing yet.
-    // Send a mark: Telnyx echoes it back when the last audio chunk finishes playing.
-    // isSpeaking stays true until onTelnyxMark() fires — this is the core barge-in fix.
+    // Send the mark now: Telnyx echoes it back when the last audio chunk finishes playing.
+    // isSpeaking stays true until onTelnyxMark() fires and the Set becomes empty.
     if (ws && ws.readyState === ws.OPEN) {
-      data.pendingMarkId = markId
       ws.send(JSON.stringify({ event: 'mark', stream_id: data.telnyxStreamId, mark: { name: markId } }))
     }
   } catch (ttsError) {
     if (ttsError instanceof Error && ttsError.name === 'AbortError') {
       console.log(`[Pipeline] TTS aborted (barge-in) ${callControlId}`)
-      return  // barge-in — don't end the call
+      return  // barge-in already cleared the Set via fireBargeIn — don't end the call
     }
     const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
     console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
-    // Clear speaking state since no mark will come back
-    data.isSpeaking = false
-    data.pendingMarkId = null
+    // Remove this mark since no audio was sent and no mark event will arrive from Telnyx
+    data.pendingMarkIds.delete(markId)
+    if (data.pendingMarkIds.size === 0) data.isSpeaking = false
     // End the call immediately — the prospect would hear silence otherwise
     endSession(callControlId, 'error')
   } finally {
@@ -429,10 +488,14 @@ export async function endSession(callControlId: string, outcome: string) {
 export function onTelnyxMark(callControlId: string, markName: string) {
   const d = activeSessions.get(callControlId)
   if (!d) return
-  if (d.pendingMarkId === markName) {
-    d.pendingMarkId = null
-    d.isSpeaking = false
-    console.log(`[Pipeline] Telnyx playback complete — mark: ${markName}`)
+  if (d.pendingMarkIds.has(markName)) {
+    d.pendingMarkIds.delete(markName)
+    if (d.pendingMarkIds.size === 0) {
+      d.isSpeaking = false
+      console.log(`[Pipeline] Telnyx playback complete — last mark: ${markName}`)
+    } else {
+      console.log(`[Pipeline] Telnyx mark received (${d.pendingMarkIds.size} still pending): ${markName}`)
+    }
   }
 }
 
