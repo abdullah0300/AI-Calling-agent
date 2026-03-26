@@ -46,9 +46,10 @@ function createDeepgramStream(config: STTStreamConfig) {
     language: 'en-GB',
     smart_format: true,
     interim_results: true,
-    utterance_end_ms: 500,
+    // utterance_end_ms removed — minimum valid value is 1000ms per Deepgram docs.
+    // We use endpointing (VAD-based) + speech_final instead for lower latency.
     vad_events: true,
-    endpointing: 300,
+    endpointing: 200,  // 200ms silence → speech_final fires. 100ms faster than 300ms, safe minimum for conversational speech
     // CRITICAL: Telnyx streams mulaw 8000Hz mono audio
     // Wrong encoding = garbage transcriptions
     encoding: 'mulaw',
@@ -62,9 +63,12 @@ function createDeepgramStream(config: STTStreamConfig) {
 
   connection.on(LiveTranscriptionEvents.Transcript, (data: any) => {
     const transcript = data?.channel?.alternatives?.[0]?.transcript
-    const isFinal = data?.is_final
-    if (transcript && transcript.trim().length > 2) {
-      config.onTranscript(transcript.trim(), isFinal)
+    const isFinal    = data?.is_final
+    // speech_final fires when endpointing detects 300ms of silence (VAD-based) — fast & accurate.
+    // Fallback to is_final ensures we never miss a turn even if speech_final isn't set.
+    const speechFinal = data?.speech_final
+    if (transcript && transcript.trim().length > 2 && (speechFinal || isFinal)) {
+      config.onTranscript(transcript.trim(), true)
     }
   })
 

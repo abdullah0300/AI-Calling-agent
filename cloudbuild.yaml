@@ -1,0 +1,18 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'europe-west2-docker.pkg.dev/webcraftio-voiceflow/cloud-run-source-deploy/voiceflow-ws-server:latest'
+      - '-f'
+      - 'Dockerfile'
+      - '.'
+
+images:
+  - 'europe-west2-docker.pkg.dev/webcraftio-voiceflow/cloud-run-source-deploy/voiceflow-ws-server:latest'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  # LEGACY writes Docker build output to Cloud Storage so it is visible in the terminal.
+  # CLOUD_LOGGING_ONLY was hiding all Docker errors — changed to LEGACY for debugging.
+  logging: LEGACY
