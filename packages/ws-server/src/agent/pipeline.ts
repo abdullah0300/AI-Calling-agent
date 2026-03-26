@@ -29,6 +29,11 @@ interface ActiveSession {
   // Platform settings loaded from DB at session start
   // API keys + global provider defaults, merged with per-agent overrides
   platformSettings: PlatformSettings | null
+  // Barge-in state — set when the agent is currently playing audio to the prospect
+  isSpeaking: boolean
+  currentTtsAbort: AbortController | null
+  // Set to true when barge-in fires mid-LLM-stream — onSentence skips remaining sentences
+  bargedIn: boolean
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -38,6 +43,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
+    isSpeaking: false, currentTtsAbort: null, bargedIn: false,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -88,7 +94,17 @@ export async function startSession(callControlId: string) {
     onTranscript: async (text, isFinal) => {
       if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
     },
-    onError: (error) => console.error(`[Pipeline] STT error ${callControlId}:`, error)
+    onError: (error) => console.error(`[Pipeline] STT error ${callControlId}:`, error),
+    onSpeechStarted: () => {
+      const d = activeSessions.get(callControlId)
+      if (!d || !d.isSpeaking) return
+      console.log(`[Pipeline] Barge-in detected — aborting TTS ${callControlId}`)
+      d.bargedIn = true
+      d.currentTtsAbort?.abort()
+      d.currentTtsAbort = null
+      d.isSpeaking = false
+      d.isProcessing = false  // allow new speech turn to start immediately
+    },
   })
 
   await speakToProspect(callControlId, session.agent.greeting_message)
@@ -108,6 +124,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   if (!data || data.isProcessing) return
 
   data.isProcessing = true
+  data.bargedIn = false  // reset — new turn starting
   const turnStart = Date.now()
   let firstChunkSent = false
 
@@ -191,12 +208,18 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
             onSentence: async (sentence) => {
               const current = activeSessions.get(callControlId)
               if (!current?.ws || current.ws.readyState !== current.ws.OPEN) return
+              if (current.bargedIn) return  // prospect interrupted — skip remaining sentences
+
+              const sentenceAbort = new AbortController()
+              current.currentTtsAbort = sentenceAbort
+              current.isSpeaking = true
               try {
                 const sentenceCost = await streamTextToSpeech({
                   provider: ttsProvider,
                   apiKey: ttsApiKey,
                   voiceId: ttsVoiceId,
                   text: sentence,
+                  abortSignal: sentenceAbort.signal,
                   onChunk: (base64Audio) => {
                     onFirstChunk()
                     const c = activeSessions.get(callControlId)
@@ -208,6 +231,11 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                 data.costTts += sentenceCost
               } catch (ttsErr) {
                 console.error(`[Pipeline] TTS stream error for sentence — ${ttsErr}`)
+              } finally {
+                if (current.currentTtsAbort === sentenceAbort) {
+                  current.currentTtsAbort = null
+                  current.isSpeaking = false
+                }
               }
             },
           })
@@ -256,6 +284,10 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
     ? platformSettings.elevenlabs_api_key
     : platformSettings.deepgram_api_key
 
+  const abortController = new AbortController()
+  data.currentTtsAbort = abortController
+  data.isSpeaking = true
+
   try {
     // Stream TTS audio chunks to Telnyx as they arrive — no waiting for full MP3
     const costUsd = await streamTextToSpeech({
@@ -263,6 +295,7 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
       apiKey: ttsApiKey,
       voiceId: ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined,
       text,
+      abortSignal: abortController.signal,
       onChunk: (base64Audio) => {
         onFirstChunk?.()
         if (ws && ws.readyState === ws.OPEN) {
@@ -273,10 +306,19 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
     data.costTts += costUsd
     console.log(`[Cost] TTS +$${costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
   } catch (ttsError) {
+    if (ttsError instanceof Error && ttsError.name === 'AbortError') {
+      console.log(`[Pipeline] TTS aborted (barge-in) ${callControlId}`)
+      return  // barge-in — don't end the call
+    }
     const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
     console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
     // End the call immediately — the prospect would hear silence otherwise
     endSession(callControlId, 'error')
+  } finally {
+    if (data.currentTtsAbort === abortController) {
+      data.currentTtsAbort = null
+      data.isSpeaking = false
+    }
   }
 }
 

@@ -6,6 +6,7 @@ export interface STTStreamConfig {
   model?: string  // e.g. 'nova-2', 'nova-3' — defaults to 'nova-2'
   onTranscript: (text: string, isFinal: boolean) => void
   onError: (error: Error) => void
+  onSpeechStarted?: () => void  // fires when Deepgram detects the prospect starting to speak (used for barge-in)
 }
 
 export function createSTTStream(config: STTStreamConfig) {
@@ -59,6 +60,10 @@ function createDeepgramStream(config: STTStreamConfig) {
 
   connection.on(LiveTranscriptionEvents.Open, () => {
     console.log('[STT] Deepgram opened')
+  })
+
+  connection.on(LiveTranscriptionEvents.SpeechStarted, () => {
+    config.onSpeechStarted?.()
   })
 
   connection.on(LiveTranscriptionEvents.Transcript, (data: any) => {
