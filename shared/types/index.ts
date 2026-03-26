@@ -18,6 +18,7 @@ export interface Agent {
   active_llm_model: string
   active_tts: TTSProvider
   active_stt: STTProvider
+  active_stt_model: string | null  // null = use global setting from settings table
   active_telephony: TelephonyProvider
   created_at: string
   updated_at: string

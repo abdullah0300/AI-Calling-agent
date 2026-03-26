@@ -224,6 +224,7 @@ const DEFAULT_AGENT: Partial<Agent> = {
   active_llm_model: 'claude-haiku-4-5',
   active_tts: 'elevenlabs',
   active_stt: 'deepgram',
+  active_stt_model: null,  // null = inherit from global Settings
   active_telephony: 'telnyx',
 }
 
@@ -526,8 +527,30 @@ export default function AgentEditPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="deepgram">Deepgram Nova-3 — Recommended</SelectItem>
+                  <SelectItem value="deepgram">Deepgram</SelectItem>
                   <SelectItem value="google">Google STT</SelectItem>
+                </SelectContent>
+              </Select>
+            </FieldGroup>
+
+            <FieldGroup
+              label="Deepgram STT Model"
+              hint="Override the global model for this agent only. Leave as 'Use global setting' to follow Settings page."
+              icon={<Mic className="h-3.5 w-3.5 text-slate-400" />}
+            >
+              <Select
+                value={agent.active_stt_model || ''}
+                onValueChange={v => handleChange('active_stt_model', v === '__global__' ? '' : v)}
+              >
+                <SelectTrigger className="bg-slate-50">
+                  <SelectValue placeholder="Use global setting" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__global__">Use global setting (Settings page)</SelectItem>
+                  <SelectItem value="flux">Flux — Voice-agent optimised (newest)</SelectItem>
+                  <SelectItem value="nova-3">Nova 3 — Best accuracy</SelectItem>
+                  <SelectItem value="nova-2-phonecall">Nova 2 Phonecall — Phone-optimised</SelectItem>
+                  <SelectItem value="nova-2">Nova 2 — Stable fallback</SelectItem>
                 </SelectContent>
               </Select>
             </FieldGroup>

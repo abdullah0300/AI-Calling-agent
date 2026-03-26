@@ -87,10 +87,13 @@ export async function startSession(callControlId: string) {
   // Provider selection: agent field wins (per-agent override), falls back to global setting
   const sttProvider = (session.agent.active_stt || platformSettings.active_stt) as 'deepgram' | 'google'
 
+  // STT model: agent-level override wins, falls back to global setting
+  const sttModel = session.agent.active_stt_model || platformSettings.active_stt_model
+
   data.sttStream = createSTTStream({
     provider: sttProvider,
     apiKey: platformSettings.deepgram_api_key,
-    model: platformSettings.active_stt_model,
+    model: sttModel,
     onTranscript: async (text, isFinal) => {
       if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
     },
