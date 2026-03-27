@@ -20,13 +20,14 @@ const patchCampaignSchema = z.object({
 // GET /api/campaigns/[id] — campaign details + live stats
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params
     const { data: campaign, error } = await supabase
       .from('campaigns')
       .select(`*, agents(name, greeting_message), phone_numbers(number, label)`)
-      .eq('id', params.id)
+      .eq('id', id)
       .single()
 
     if (error || !campaign) {
@@ -37,7 +38,7 @@ export async function GET(
     const { data: leads } = await supabase
       .from('leads')
       .select('id, status, retry_count, scheduled_after, business_name, phone_number')
-      .eq('campaign_id', params.id)
+      .eq('campaign_id', id)
 
     const stats = {
       total:         leads?.length ?? 0,
@@ -55,7 +56,7 @@ export async function GET(
     const { data: costRows } = await supabase
       .from('calls')
       .select('cost_total')
-      .eq('campaign_id', params.id)
+      .eq('campaign_id', id)
       .eq('status', 'completed')
 
     const totalCost = (costRows || []).reduce((sum, r) => sum + (r.cost_total ?? 0), 0)
@@ -74,9 +75,10 @@ export async function GET(
 //   running|paused → completed (force stop)
 export async function PATCH(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params
     const body = await req.json()
     const parsed = patchCampaignSchema.safeParse(body)
     if (!parsed.success) {
@@ -94,7 +96,7 @@ export async function PATCH(
     const { data: campaign, error } = await supabase
       .from('campaigns')
       .update(updates)
-      .eq('id', params.id)
+      .eq('id', id)
       .select()
       .single()
 
@@ -111,13 +113,14 @@ export async function PATCH(
 // DELETE /api/campaigns/[id] — remove campaign (only if draft or completed)
 export async function DELETE(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params
     const { data: campaign } = await supabase
       .from('campaigns')
       .select('status')
-      .eq('id', params.id)
+      .eq('id', id)
       .single()
 
     if (!campaign) {
@@ -131,9 +134,9 @@ export async function DELETE(
     }
 
     // Detach leads before deleting (nullify campaign_id so leads aren't lost)
-    await supabase.from('leads').update({ campaign_id: null }).eq('campaign_id', params.id)
+    await supabase.from('leads').update({ campaign_id: null }).eq('campaign_id', id)
 
-    const { error } = await supabase.from('campaigns').delete().eq('id', params.id)
+    const { error } = await supabase.from('campaigns').delete().eq('id', id)
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
 
     return NextResponse.json({ success: true })
