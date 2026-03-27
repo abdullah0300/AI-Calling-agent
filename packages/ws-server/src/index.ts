@@ -18,6 +18,30 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', activeCalls: activeSessions.size, timestamp: new Date().toISOString() })
 })
 
+// Real-time monitoring — returns a sanitised snapshot of every live session.
+// Called every 5s by the dashboard monitoring page.
+app.get('/monitoring/live', (_req, res) => {
+  const sessions = Array.from(activeSessions.entries()).map(([ccid, d]) => ({
+    callControlId:   ccid,
+    callId:          d.session.callId,
+    leadName:        d.session.lead?.business_name ?? 'Unknown',
+    phoneNumber:     d.session.lead?.phone_number  ?? '',
+    agentName:       d.session.agent?.name         ?? 'Unknown',
+    campaignId:      d.session.campaignId          ?? null,
+    isSpeaking:      d.isSpeaking,
+    isProcessing:    d.isProcessing,
+    turnCount:       d.conversationHistory.length,
+    elapsedSeconds:  Math.floor((Date.now() - d.session.startTime.getTime()) / 1000),
+    costLlm:         d.costLlm,
+    costTts:         d.costTts,
+    costStt:         d.sttAudioBytes * (0.0077 / 60 / 8000),
+    avgLatencyMs:    d.latencyMeasurements.length
+      ? Math.round(d.latencyMeasurements.reduce((a, b) => a + b, 0) / d.latencyMeasurements.length)
+      : null,
+  }))
+  res.json({ activeCalls: sessions.length, sessions })
+})
+
 // Called by Next.js dashboard to register session before call starts
 app.post('/session/register', (req, res) => {
   const session: CallSession = req.body
