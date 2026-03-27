@@ -10,6 +10,7 @@ import {
   destroyNoiseSuppressionState,
   denoiseAudioChunk,
 } from '../providers/noise-suppression'
+import { startRecording, stopRecording } from '../providers/recording'
 import type { PlatformSettings } from '../db/settings'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
 import type WebSocket from 'ws'
@@ -238,6 +239,19 @@ export async function startSession(callControlId: string) {
   // Agent's active_llm/stt/tts override the global defaults for provider routing
   const platformSettings = await loadSettings()
   data.platformSettings = platformSettings
+
+  // Start call recording if enabled — fire-and-forget, non-blocking.
+  // The recording URL is delivered later via the call.recording.saved webhook.
+  if (platformSettings.recording_enabled && platformSettings.telnyx_api_key) {
+    startRecording(callControlId, platformSettings.telnyx_api_key)
+      .then(() => {
+        console.log(`[Recording] Started dual-channel recording for ${callControlId}`)
+        return supabase.from('calls')
+          .update({ recording_status: 'in_progress' })
+          .eq('id', session.callId)
+      })
+      .catch(err => console.error(`[Recording] Failed to start recording ${callControlId}:`, err))
+  }
 
   await supabase.from('calls')
     .update({ status: 'in_progress', started_at: new Date().toISOString() })
@@ -593,6 +607,13 @@ export async function endSession(callControlId: string, outcome: string) {
   console.log(`[Pipeline] Ending ${callControlId} — outcome: ${outcome}`)
 
   const { session, sttStream, maxDurationTimer } = data
+
+  // Stop recording (fire-and-forget) — Telnyx finalises the file and sends
+  // call.recording.saved webhook with the download URL. 422/404 are safe to ignore.
+  if (data.platformSettings?.recording_enabled && data.platformSettings.telnyx_api_key) {
+    stopRecording(callControlId, data.platformSettings.telnyx_api_key)
+      .catch(err => console.error(`[Recording] stopRecording error ${callControlId}:`, err))
+  }
 
   if (maxDurationTimer) clearTimeout(maxDurationTimer)
   if (data.falseBargeInTimer) clearTimeout(data.falseBargeInTimer)

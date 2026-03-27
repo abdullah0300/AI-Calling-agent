@@ -21,6 +21,10 @@ export interface PlatformSettings {
   calling_hours_enabled: boolean
   calling_hours_start: number    // 0–23, inclusive (default: 8  = 8:00 AM)
   calling_hours_end: number      // 0–23, exclusive (default: 21 = 9:00 PM)
+  // Call recording (Item 9)
+  // When true, dual-channel MP3 recording is started at session open.
+  // Disabled by default — enable only after confirming legal disclosure is in place.
+  recording_enabled: boolean
 }
 
 export async function loadSettings(): Promise<PlatformSettings> {
@@ -48,5 +52,6 @@ export async function loadSettings(): Promise<PlatformSettings> {
     calling_hours_enabled: (map.calling_hours_enabled ?? 'true') !== 'false',
     calling_hours_start:   parseInt(map.calling_hours_start   ?? '8',  10),
     calling_hours_end:     parseInt(map.calling_hours_end     ?? '21', 10),
+    recording_enabled:     (map.recording_enabled ?? 'false') === 'true',
   }
 }

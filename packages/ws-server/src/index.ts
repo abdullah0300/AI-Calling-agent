@@ -7,6 +7,7 @@ import {
   startSession, handleAudioChunk, endSession, updateTelephonyCost, onTelnyxMark
 } from './agent/pipeline'
 import { startDialerLoop } from './dialer/engine'
+import { supabase } from './db/client'
 import type { CallSession } from '@voiceflow/shared'
 
 const app = express()
@@ -56,6 +57,23 @@ app.post('/api/webhook/telnyx', async (req, res) => {
           .catch(() => {})
       }
       break
+
+    case 'call.recording.saved': {
+      // Telnyx sends this after the recording is fully encoded and available.
+      // payload.recording_urls.mp3 contains the HTTPS download URL.
+      const ccid       = payload?.call_control_id
+      const recordingUrl = payload?.recording_urls?.mp3 || payload?.recording_urls?.wav || null
+      if (ccid && recordingUrl) {
+        await supabase.from('calls')
+          .update({ recording_url: recordingUrl, recording_status: 'available' })
+          .eq('telephony_call_id', ccid)
+          .catch(err => console.error('[Recording] Failed to save recording URL:', err))
+        console.log(`[Recording] Saved recording URL for ${ccid}: ${recordingUrl}`)
+      } else {
+        console.warn('[Recording] call.recording.saved missing call_control_id or URL', JSON.stringify(payload))
+      }
+      break
+    }
 
     case 'call.cost': {
       // Telnyx sends exact telephony charge after call ends
