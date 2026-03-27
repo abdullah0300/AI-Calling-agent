@@ -13,7 +13,8 @@
 import { supabase } from '../db/client'
 import { loadSettings } from '../db/settings'
 import { activeSessions, registerSession } from '../agent/pipeline'
-import type { CallSession } from '@voiceflow/shared'
+import { isWithinCallingHours, formatLocalTime } from '../utils/calling-hours'
+import type { CallSession, Lead } from '@voiceflow/shared'
 
 const TICK_INTERVAL_MS = 5_000  // how often to check for pending calls
 
@@ -26,15 +27,21 @@ export function startDialerLoop(): void {
 
 async function dialerTick(): Promise<void> {
   try {
-    const { data: campaigns } = await supabase
-      .from('campaigns')
-      .select(`*, agents(*), phone_numbers(*)`)
-      .eq('status', 'running')
+    const [{ data: campaigns }, settings] = await Promise.all([
+      supabase.from('campaigns').select(`*, agents(*), phone_numbers(*)`).eq('status', 'running'),
+      loadSettings(),
+    ])
 
     if (!campaigns?.length) return
 
+    const callingHoursConfig = {
+      enabled:   settings.calling_hours_enabled,
+      startHour: settings.calling_hours_start,
+      endHour:   settings.calling_hours_end,
+    }
+
     // Process campaigns in parallel — each is independent
-    await Promise.all(campaigns.map(processCampaign))
+    await Promise.all(campaigns.map(c => processCampaign(c, callingHoursConfig)))
   } catch (err) {
     console.error('[Dialer] Tick error:', err)
   }
@@ -42,7 +49,7 @@ async function dialerTick(): Promise<void> {
 
 // ─── Per-campaign slot management ────────────────────────────────────────────
 
-async function processCampaign(campaign: any): Promise<void> {
+async function processCampaign(campaign: any, callingHoursConfig: { enabled: boolean; startHour: number; endHour: number }): Promise<void> {
   if (!campaign.agents || !campaign.phone_numbers) {
     console.warn(`[Dialer] Campaign ${campaign.id} missing agent or phone number — skipping`)
     return
@@ -71,21 +78,25 @@ async function processCampaign(campaign: any): Promise<void> {
   )
 
   for (let i = 0; i < slotsAvailable; i++) {
-    const result = await dispatchNextLead(campaign)
+    const result = await dispatchNextLead(campaign, callingHoursConfig)
     if (result === 'no_leads') {
       await checkCampaignCompletion(campaign.id, campaign.name)
       break
     }
-    // result === 'dispatched' | 'lock_failed' — continue loop or break
-    if (result === 'lock_failed') break
+    // 'outside_hours' — all leads in this campaign are in the same timezone; no point
+    // trying further slots this tick. The dialer will re-check on the next tick.
+    if (result === 'lock_failed' || result === 'outside_hours') break
   }
 }
 
 // ─── Lead dispatch ───────────────────────────────────────────────────────────
 
-type DispatchResult = 'dispatched' | 'no_leads' | 'lock_failed'
+type DispatchResult = 'dispatched' | 'no_leads' | 'lock_failed' | 'outside_hours'
 
-async function dispatchNextLead(campaign: any): Promise<DispatchResult> {
+async function dispatchNextLead(
+  campaign: any,
+  callingHoursConfig: { enabled: boolean; startHour: number; endHour: number },
+): Promise<DispatchResult> {
   const now = new Date().toISOString()
 
   // Fetch the next lead that is pending and past its scheduled_after window
@@ -100,6 +111,18 @@ async function dispatchNextLead(campaign: any): Promise<DispatchResult> {
     .maybeSingle()
 
   if (!lead) return 'no_leads'
+
+  // Calling hours check — don't call the prospect outside their local business hours.
+  // We check BEFORE locking the lead so it stays 'pending' and surfaces again once
+  // the window opens. No DB write needed — the next tick will re-check.
+  if (!isWithinCallingHours(lead.country || 'GB', callingHoursConfig)) {
+    const localTime = formatLocalTime(lead.country || 'GB')
+    console.log(
+      `[Dialer] Skipping lead ${lead.id} — outside calling hours for ${lead.country} ` +
+      `(local time: ${localTime}, window: ${callingHoursConfig.startHour}:00–${callingHoursConfig.endHour}:00)`
+    )
+    return 'outside_hours'
+  }
 
   // Optimistic lock: transition pending → calling atomically.
   // If two ticks somehow race (multiple ws-server instances), only one wins.

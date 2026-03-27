@@ -16,6 +16,11 @@ export interface PlatformSettings {
   elevenlabs_voice_id: string
   telnyx_api_key: string
   telnyx_connection_id: string
+  // Calling hours enforcement (Item 8)
+  // Outbound calls are blocked outside startHour–endHour in the prospect's local timezone.
+  calling_hours_enabled: boolean
+  calling_hours_start: number    // 0–23, inclusive (default: 8  = 8:00 AM)
+  calling_hours_end: number      // 0–23, exclusive (default: 21 = 9:00 PM)
 }
 
 export async function loadSettings(): Promise<PlatformSettings> {
@@ -40,5 +45,8 @@ export async function loadSettings(): Promise<PlatformSettings> {
     elevenlabs_voice_id:  map.elevenlabs_voice_id  || process.env.ELEVENLABS_VOICE_ID  || '21m00Tcm4TlvDq8ikWAM',
     telnyx_api_key:       map.telnyx_api_key       || process.env.TELNYX_API_KEY       || '',
     telnyx_connection_id: map.telnyx_connection_id || process.env.TELNYX_CONNECTION_ID || '',
+    calling_hours_enabled: (map.calling_hours_enabled ?? 'true') !== 'false',
+    calling_hours_start:   parseInt(map.calling_hours_start   ?? '8',  10),
+    calling_hours_end:     parseInt(map.calling_hours_end     ?? '21', 10),
   }
 }

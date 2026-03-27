@@ -9,10 +9,40 @@ const supabase = createClient(
 )
 
 const initiateCallSchema = z.object({
-  leadId: z.string().uuid(),
-  agentId: z.string().uuid(),
-  phoneNumberId: z.string().uuid(),
+  leadId:               z.string().uuid(),
+  agentId:              z.string().uuid(),
+  phoneNumberId:        z.string().uuid(),
+  // Set to true to bypass the calling-hours check (use for urgent manual calls)
+  overrideCallingHours: z.boolean().optional().default(false),
 })
+
+// ─── Inline calling-hours helper (mirrors ws-server/src/utils/calling-hours.ts)
+// The dashboard cannot import from ws-server so the minimal logic is duplicated here.
+const COUNTRY_TZ: Record<string, string> = {
+  GB:'Europe/London', UK:'Europe/London', IE:'Europe/Dublin',
+  DE:'Europe/Berlin', FR:'Europe/Paris',  ES:'Europe/Madrid',  IT:'Europe/Rome',
+  NL:'Europe/Amsterdam', BE:'Europe/Brussels', CH:'Europe/Zurich', AT:'Europe/Vienna',
+  PT:'Europe/Lisbon', SE:'Europe/Stockholm', NO:'Europe/Oslo', DK:'Europe/Copenhagen',
+  FI:'Europe/Helsinki', PL:'Europe/Warsaw', CZ:'Europe/Prague', HU:'Europe/Budapest',
+  RO:'Europe/Bucharest', GR:'Europe/Athens', TR:'Europe/Istanbul',
+  ZA:'Africa/Johannesburg', IN:'Asia/Kolkata', SG:'Asia/Singapore',
+  JP:'Asia/Tokyo', HK:'Asia/Hong_Kong', AU:'Australia/Sydney', NZ:'Pacific/Auckland',
+  US:'America/New_York', CA:'America/Toronto', MX:'America/Mexico_City',
+  BR:'America/Sao_Paulo', AE:'Asia/Dubai', SA:'Asia/Riyadh',
+}
+function prospectLocalHour(countryCode: string): number {
+  const tz = COUNTRY_TZ[(countryCode || 'GB').toUpperCase()] ?? 'Europe/London'
+  try {
+    const h = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: 'numeric', hour12: false }).format(new Date())
+    return parseInt(h, 10) % 24
+  } catch { return 12 }  // unknown timezone — assume midday (safe default)
+}
+function prospectLocalTimeStr(countryCode: string): string {
+  const tz = COUNTRY_TZ[(countryCode || 'GB').toUpperCase()] ?? 'Europe/London'
+  try {
+    return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour:'2-digit', minute:'2-digit', hour12:false, timeZoneName:'short' }).format(new Date())
+  } catch { return 'unknown' }
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -22,7 +52,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid request', details: parsed.error.flatten() }, { status: 400 })
     }
 
-    const { leadId, agentId, phoneNumberId } = parsed.data
+    const { leadId, agentId, phoneNumberId, overrideCallingHours } = parsed.data
 
     const [leadRes, agentRes, phoneRes] = await Promise.all([
       supabase.from('leads').select('*').eq('id', leadId).single(),
@@ -37,6 +67,35 @@ export async function POST(req: NextRequest) {
     const lead = leadRes.data as Lead
     const agent = agentRes.data as Agent
     const phoneNumber = phoneRes.data
+
+    // ── Calling hours enforcement ─────────────────────────────────────────────
+    if (!overrideCallingHours) {
+      const { data: chSettings } = await supabase
+        .from('settings')
+        .select('key, value')
+        .in('key', ['calling_hours_enabled', 'calling_hours_start', 'calling_hours_end'])
+
+      const chMap = Object.fromEntries((chSettings || []).map(r => [r.key, r.value]))
+      const chEnabled   = (chMap.calling_hours_enabled ?? 'true') !== 'false'
+      const chStart     = parseInt(chMap.calling_hours_start ?? '8',  10)
+      const chEnd       = parseInt(chMap.calling_hours_end   ?? '21', 10)
+
+      if (chEnabled) {
+        const country  = lead.country || 'GB'
+        const localHour = prospectLocalHour(country)
+        if (localHour < chStart || localHour >= chEnd) {
+          const localTime = prospectLocalTimeStr(country)
+          return NextResponse.json(
+            {
+              error: `Call blocked: outside calling hours for this prospect's timezone.`,
+              detail: `Local time in ${country}: ${localTime}. Allowed window: ${chStart}:00–${chEnd}:00.`,
+              hint:   'Pass overrideCallingHours: true to place the call anyway.',
+            },
+            { status: 422 }
+          )
+        }
+      }
+    }
 
     // Prevent duplicate active calls for same lead
     // .maybeSingle() returns null (not an error) when no row found — .single() would throw 406
