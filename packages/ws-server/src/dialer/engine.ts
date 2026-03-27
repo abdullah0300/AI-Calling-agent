@@ -126,14 +126,14 @@ async function dispatchNextLead(
 
   // Optimistic lock: transition pending → calling atomically.
   // If two ticks somehow race (multiple ws-server instances), only one wins.
-  const { error: lockError, count } = await supabase
+  const { error: lockError, data: lockData } = await supabase
     .from('leads')
     .update({ status: 'calling' })
     .eq('id', lead.id)
     .eq('status', 'pending')  // only update if still pending
-    .select('id', { count: 'exact', head: true })
+    .select('id')
 
-  if (lockError || (count ?? 0) === 0) {
+  if (lockError || !lockData || lockData.length === 0) {
     // Another process claimed this lead between SELECT and UPDATE
     console.warn(`[Dialer] Lead ${lead.id} already claimed — skipping`)
     return 'lock_failed'
@@ -209,7 +209,7 @@ async function placeCall(campaign: any, lead: any): Promise<void> {
     throw new Error(`Telnyx API ${telnyxRes.status}: ${errBody}`)
   }
 
-  const telnyxData    = await telnyxRes.json()
+  const telnyxData    = await telnyxRes.json() as { data: { call_control_id: string } }
   const callControlId = telnyxData.data.call_control_id
 
   await supabase.from('calls')

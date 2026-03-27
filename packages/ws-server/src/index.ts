@@ -88,10 +88,10 @@ app.post('/api/webhook/telnyx', async (req, res) => {
       const ccid       = payload?.call_control_id
       const recordingUrl = payload?.recording_urls?.mp3 || payload?.recording_urls?.wav || null
       if (ccid && recordingUrl) {
-        await supabase.from('calls')
+        const { error: recErr } = await supabase.from('calls')
           .update({ recording_url: recordingUrl, recording_status: 'available' })
           .eq('telephony_call_id', ccid)
-          .catch(err => console.error('[Recording] Failed to save recording URL:', err))
+        if (recErr) console.error('[Recording] Failed to save recording URL:', recErr.message)
         console.log(`[Recording] Saved recording URL for ${ccid}: ${recordingUrl}`)
       } else {
         console.warn('[Recording] call.recording.saved missing call_control_id or URL', JSON.stringify(payload))
