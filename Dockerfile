@@ -27,6 +27,9 @@ RUN pnpm --filter @voiceflow/ws-server build
 #   - No dangling workspace: references in the output
 RUN pnpm deploy --filter=@voiceflow/ws-server --legacy --prod /prod/ws-server
 
+# pnpm deploy respects .gitignore, which excludes dist/ — copy it explicitly
+RUN cp -r /usr/src/app/packages/ws-server/dist /prod/ws-server/dist
+
 
 # ── Runtime stage (lean production image) ─────────────────────────────────────
 FROM base AS runtime
