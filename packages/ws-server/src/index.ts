@@ -6,6 +6,7 @@ import {
   activeSessions, registerSession, attachWebSocket,
   startSession, handleAudioChunk, endSession, updateTelephonyCost, onTelnyxMark
 } from './agent/pipeline'
+import { startDialerLoop } from './dialer/engine'
 import type { CallSession } from '@voiceflow/shared'
 
 const app = express()
@@ -156,6 +157,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Running on port ${PORT}`)
   console.log(`[Server] Health: http://localhost:${PORT}/health`)
   console.log(`[Server] WebSocket: ws://localhost:${PORT}/audio`)
+
+  // Start the batch dialer loop after the server is listening.
+  // The loop polls the DB every 5s for running campaigns and dispatches calls.
+  startDialerLoop()
 })
 
 process.on('SIGTERM', () => {

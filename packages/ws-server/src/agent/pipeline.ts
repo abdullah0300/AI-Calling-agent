@@ -585,7 +585,51 @@ export async function endSession(callControlId: string, outcome: string) {
     supabase.from('leads').update({ status: leadStatus }).eq('id', session.leadId),
   ])
 
+  // Batch dialer retry: if this call was part of a campaign and the outcome is
+  // retry-eligible (e.g. no_answer), reset the lead to 'pending' with a
+  // scheduled_after timestamp so the dialer picks it up again after the delay.
+  if (session.campaignId) {
+    await scheduleRetryIfNeeded(session.leadId, session.campaignId, outcome)
+      .catch(err => console.error('[Dialer] Retry scheduling error:', err))
+  }
+
   console.log(`[Pipeline] Session cleaned up: ${callControlId}`)
+}
+
+// ─── Batch dialer retry scheduling ───────────────────────────────────────────
+// Called after every campaign call ends. If the outcome matches the campaign's
+// retry_outcomes list AND retries remain, reset the lead to 'pending' with
+// scheduled_after set to now + retry_delay_minutes.
+// The dialer loop skips leads where scheduled_after > now, so the retry
+// happens automatically at the right time without any polling overhead.
+async function scheduleRetryIfNeeded(leadId: string, campaignId: string, outcome: string): Promise<void> {
+  const [{ data: campaign }, { data: lead }] = await Promise.all([
+    supabase.from('campaigns')
+      .select('retry_attempts, retry_delay_minutes, retry_outcomes')
+      .eq('id', campaignId)
+      .maybeSingle(),
+    supabase.from('leads')
+      .select('retry_count')
+      .eq('id', leadId)
+      .maybeSingle(),
+  ])
+
+  if (!campaign || !lead) return
+
+  const retryOutcomes: string[] = campaign.retry_outcomes ?? ['no_answer']
+  if (!retryOutcomes.includes(outcome)) return              // terminal outcome — no retry
+  if ((lead.retry_count ?? 0) >= campaign.retry_attempts) return  // retries exhausted
+
+  const newRetryCount  = (lead.retry_count ?? 0) + 1
+  const scheduledAfter = new Date(Date.now() + campaign.retry_delay_minutes * 60_000)
+
+  await supabase.from('leads').update({
+    status:          'pending',
+    retry_count:     newRetryCount,
+    scheduled_after: scheduledAfter.toISOString(),
+  }).eq('id', leadId)
+
+  console.log(`[Dialer] Retry ${newRetryCount}/${campaign.retry_attempts} scheduled for lead ${leadId} at ${scheduledAfter.toISOString()} (outcome: ${outcome})`)
 }
 
 // Called from index.ts when Telnyx echoes back a mark — signals true end of audio playback on the call.
