@@ -17,9 +17,6 @@
 //   - Latency: ~13ms (480 samples at 48kHz per frame)
 //   - CPU: low (~2–3% single core)
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const createRNNoise = require('@jitsi/rnnoise-wasm')
-
 const INPUT_RATE    = 8000   // Telnyx sends mulaw at 8kHz
 const PROCESS_RATE  = 48000  // RNNoise requires 48kHz
 const UPSAMPLE      = PROCESS_RATE / INPUT_RATE  // 6x
@@ -30,11 +27,15 @@ let wasmModule: any = null
 let initPromise: Promise<void> | null = null
 
 // Call once at server startup. Safe to call multiple times.
+// The require() is inside the try-catch so a missing WASM file (e.g. when
+// pnpm deploy strips binary assets) is a warning, not a fatal crash.
 export async function initNoiseSuppression(): Promise<void> {
   if (wasmModule) return
   if (initPromise) return initPromise
   initPromise = (async () => {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const createRNNoise = require('@jitsi/rnnoise-wasm')
       wasmModule = await createRNNoise()
       console.log('[NoiseSuppression] RNNoise WASM loaded — noise suppression active')
     } catch (err) {
