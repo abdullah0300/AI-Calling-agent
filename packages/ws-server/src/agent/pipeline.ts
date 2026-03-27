@@ -4,21 +4,57 @@ import { streamAgentResponse } from '../providers/llm'
 import { detectScenario, buildSystemPrompt } from './scenarios'
 import { supabase } from '../db/client'
 import { loadSettings } from '../db/settings'
+import {
+  initNoiseSuppression,
+  createNoiseSuppressionState,
+  destroyNoiseSuppressionState,
+  denoiseAudioChunk,
+} from '../providers/noise-suppression'
+import { startRecording, stopRecording } from '../providers/recording'
 import type { PlatformSettings } from '../db/settings'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
 import type WebSocket from 'ws'
+
+// Initialise RNNoise WASM once at module load — all sessions share the same module.
+// Sessions each get their own stateful RNNoise handle (createNoiseSuppressionState).
+initNoiseSuppression()
 
 // Deepgram Nova-3 streaming rate (2026): $0.0077 / min
 // (source: deepgram.com/pricing)
 const DEEPGRAM_STT_PER_BYTE = 0.0077 / 60 / 8000  // $0.0077/min ÷ 60s ÷ 8000 bytes/s (mulaw 8kHz)
 
 // ─── Local VAD constants for fast barge-in ───────────────────────────────────
-// Vapi/LiveKit detect barge-in in ~80ms using raw audio energy (VAD), not by waiting
-// for the STT model to make a decision. We mirror this with a simple energy threshold.
-// Telnyx sends mulaw 8kHz. When decoded to linear16: silence ~0-200 RMS, noise ~200-600,
-// speech ~600-5000. We require sustained speech (150ms) above threshold to fire barge-in.
-const BARGE_IN_ENERGY_THRESHOLD = 600   // RMS of decoded linear16 — above this = likely speech
-const BARGE_IN_MIN_SPEECH_MS    = 150   // ms of sustained speech before triggering barge-in
+// After RNNoise denoising, audio reaching this VAD is already cleaned.
+// Threshold raised from 600 → 2000: on a denoised signal, real speech from the
+// prospect sits at 1500-5000 RMS while residual noise stays below 1000.
+// Min duration raised from 150ms → 500ms: matches LiveKit/BytePlus industry
+// standard — filters coughs, door slams, and short background bursts that a
+// denoiser can't fully eliminate.
+const BARGE_IN_ENERGY_THRESHOLD = 2000  // RMS of decoded linear16 — above this = likely speech
+const BARGE_IN_MIN_SPEECH_MS    = 500   // ms of sustained speech before triggering barge-in
+
+// ─── Backchannel detection ────────────────────────────────────────────────────
+// Backchannel utterances ("yeah", "uh-huh", "okay") are acknowledgment sounds
+// the prospect makes WHILE the agent is speaking. They are NOT interruptions and
+// should NOT trigger a full LLM response. This list covers the most common ones.
+const BACKCHANNEL_WORDS = new Set([
+  'yeah', 'yes', 'yep', 'yup', 'ya',
+  'uh-huh', 'mm-hmm', 'mhm', 'mm', 'hmm', 'hm',
+  'ok', 'okay',
+  'alright', 'alright.', 'right',
+  'sure', 'got it',
+  'i see', 'oh', 'ah',
+  'uh', 'um',
+  'cool', 'great', 'fine',
+])
+
+// Returns true when every word in text is a backchannel acknowledgment.
+// Used to ignore filler responses that don't warrant an agent reply.
+function isBackchannelOnly(text: string): boolean {
+  const words = text.toLowerCase().replace(/[.,!?]/g, '').trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0 || words.length > 4) return false  // >4 words = real speech
+  return words.every(w => BACKCHANNEL_WORDS.has(w))
+}
 
 // Decodes a mulaw 8kHz buffer and returns its RMS energy (linear16 scale).
 // Used by local VAD to detect prospect speech during agent audio playback.
@@ -70,17 +106,39 @@ interface ActiveSession {
   // Accumulated ms of audio above speech-energy threshold — for local VAD barge-in detection.
   // Reset to 0 when energy drops below threshold or barge-in fires.
   vadSpeechMs: number
+  // RNNoise denoising state handle for this session — one stateful handle per call so
+  // the recurrent network can track noise profile across frames.
+  denoisingSessionId: string
+  // False interruption recovery (Item 3):
+  // Stores the text the agent was speaking when barge-in fired so we can resume
+  // if no real transcript arrives within the recovery window.
+  currentSpeakingText: string | null
+  // Timer ID for the false barge-in recovery window (2.5s).
+  // Cancelled immediately when a real transcript arrives in handleProspectSpeech.
+  // Fires speakToProspect with currentSpeakingText if the window expires without a transcript.
+  falseBargeInTimer: NodeJS.Timeout | null
+  // Barge-in event logging (Item 6):
+  // DB row ID of the most recent barge-in event that hasn't been resolved yet.
+  // Set asynchronously after fireBargeIn inserts the row; cleared when the
+  // outcome is determined (real or false) and the row is updated.
+  pendingBargeInEventId: string | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
 
 export function registerSession(callControlId: string, session: CallSession) {
+  // Create a unique ID for this session's RNNoise state.
+  // The state must exist before the first audio chunk arrives.
+  const denoisingSessionId = `ns_${callControlId}`
+  createNoiseSuppressionState(denoisingSessionId)
+
   activeSessions.set(callControlId, {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
     isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
-    pendingMarkIds: new Set<string>(), vadSpeechMs: 0,
+    pendingMarkIds: new Set<string>(), vadSpeechMs: 0, denoisingSessionId,
+    currentSpeakingText: null, falseBargeInTimer: null, pendingBargeInEventId: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -96,10 +154,18 @@ export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?:
 
 // Central barge-in handler — called by both the STT onSpeechStarted callback AND the local VAD.
 // Immediately stops TTS, clears all pending marks, and clears Telnyx's audio buffer.
-function fireBargeIn(callControlId: string): void {
+// Starts a 2.5s false-barge-in recovery timer: if no real transcript arrives within
+// that window (meaning the barge-in was triggered by noise, not actual speech),
+// the agent resumes speaking from where it left off.
+// Every firing inserts a row into barge_in_events; the outcome is resolved later.
+function fireBargeIn(callControlId: string, source: 'vad' | 'stt'): void {
   const d = activeSessions.get(callControlId)
   if (!d || !d.isSpeaking) return
-  console.log(`[Pipeline] Barge-in detected — aborting TTS ${callControlId}`)
+  console.log(`[Pipeline] Barge-in detected (${source}) — aborting TTS ${callControlId}`)
+
+  // Snapshot what the agent was saying so we can recover if it was a false barge-in
+  const textToRecover = d.currentSpeakingText
+
   d.bargedIn = true
   d.currentTtsAbort?.abort()
   d.currentTtsAbort = null
@@ -107,9 +173,56 @@ function fireBargeIn(callControlId: string): void {
   d.pendingMarkIds.clear()
   d.vadSpeechMs = 0
   d.isProcessing = false  // allow new speech turn to start immediately
+  d.pendingBargeInEventId = null  // reset — will be set once insert resolves
+
   if (d.ws && d.ws.readyState === d.ws.OPEN) {
     d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
     console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
+  }
+
+  // Log the barge-in event to DB — fire-and-forget, non-blocking.
+  // The outcome starts as 'pending' and is resolved to 'real' or 'false' below.
+  supabase.from('barge_in_events').insert({
+    call_id:   d.session.callId,
+    fired_at:  new Date().toISOString(),
+    agent_text: textToRecover,
+    trigger:   source,
+    outcome:   'pending',
+  }).select('id').single().then(({ data, error }) => {
+    if (error) {
+      console.error('[BargeIn] DB log insert failed:', error.message)
+      return
+    }
+    // Store the row ID so the resolution step can update it
+    const current = activeSessions.get(callControlId)
+    if (current && data) current.pendingBargeInEventId = data.id
+  }).catch(err => console.error('[BargeIn] DB log insert error:', err))
+
+  // False barge-in recovery: if no transcript arrives within 2.5s, the interruption
+  // was caused by noise (not real speech) — resume agent audio from the saved text.
+  if (textToRecover) {
+    if (d.falseBargeInTimer) clearTimeout(d.falseBargeInTimer)
+    d.falseBargeInTimer = setTimeout(async () => {
+      d.falseBargeInTimer = null
+      const current = activeSessions.get(callControlId)
+      // Only recover if the session still exists, nothing new is processing or speaking,
+      // and the agent hasn't already started a new turn via a real transcript.
+      if (!current || current.isProcessing || current.isSpeaking) return
+      console.log(`[Pipeline] False barge-in recovery — no transcript in 2.5s, resuming: "${textToRecover}"`)
+      current.bargedIn = false
+
+      // Resolve the barge-in event as 'false' — noise triggered it, not real speech
+      if (current.pendingBargeInEventId) {
+        const eventId = current.pendingBargeInEventId
+        current.pendingBargeInEventId = null
+        supabase.from('barge_in_events').update({
+          outcome:     'false',
+          resolved_at: new Date().toISOString(),
+        }).eq('id', eventId).catch(err => console.error('[BargeIn] DB false-outcome update failed:', err))
+      }
+
+      await speakToProspect(callControlId, textToRecover)
+    }, 2500)
   }
 }
 
@@ -126,6 +239,19 @@ export async function startSession(callControlId: string) {
   // Agent's active_llm/stt/tts override the global defaults for provider routing
   const platformSettings = await loadSettings()
   data.platformSettings = platformSettings
+
+  // Start call recording if enabled — fire-and-forget, non-blocking.
+  // The recording URL is delivered later via the call.recording.saved webhook.
+  if (platformSettings.recording_enabled && platformSettings.telnyx_api_key) {
+    startRecording(callControlId, platformSettings.telnyx_api_key)
+      .then(() => {
+        console.log(`[Recording] Started dual-channel recording for ${callControlId}`)
+        return supabase.from('calls')
+          .update({ recording_status: 'in_progress' })
+          .eq('id', session.callId)
+      })
+      .catch(err => console.error(`[Recording] Failed to start recording ${callControlId}:`, err))
+  }
 
   await supabase.from('calls')
     .update({ status: 'in_progress', started_at: new Date().toISOString() })
@@ -158,7 +284,7 @@ export async function startSession(callControlId: string) {
     // STT-based barge-in: Deepgram fires SpeechStarted (Nova-2) or StartOfTurn (Flux)
     // when it detects the prospect starting to speak. We also run a parallel local VAD
     // in handleAudioChunk for faster (~80ms) detection independent of the STT model.
-    onSpeechStarted: () => fireBargeIn(callControlId),
+    onSpeechStarted: () => fireBargeIn(callControlId, 'stt'),
   })
 
   await speakToProspect(callControlId, session.agent.greeting_message)
@@ -168,24 +294,31 @@ export async function startSession(callControlId: string) {
 export async function handleAudioChunk(callControlId: string, audioBuffer: Buffer) {
   const data = activeSessions.get(callControlId)
   if (!data?.sttStream) return
-  // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
-  data.sttAudioBytes += audioBuffer.length
-  data.sttStream.sendAudio(audioBuffer)
 
-  // ── Local VAD barge-in (runs on every audio chunk while agent is speaking) ──
-  // Vapi/LiveKit detect interruptions in ~80ms via raw audio energy, not by waiting
-  // for the STT model to make a decision. This mirrors that approach.
-  // Only active when isSpeaking=true — no point running when agent is silent.
+  // ── Noise suppression (RNNoise) ───────────────────────────────────────────
+  // Clean the audio BEFORE it reaches VAD or STT. This is the core fix for
+  // false barge-ins triggered by background noise (HVAC, traffic, TV audio).
+  // denoiseAudioChunk falls back to the original buffer if WASM isn't loaded.
+  const cleanBuffer = denoiseAudioChunk(data.denoisingSessionId, audioBuffer)
+
+  // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
+  data.sttAudioBytes += cleanBuffer.length
+  // Send denoised audio to STT — Deepgram sees cleaner signal, fewer false starts
+  data.sttStream.sendAudio(cleanBuffer)
+
+  // ── Local VAD barge-in (runs on denoised audio while agent is speaking) ───
+  // Energy VAD now operates on cleaned audio — background noise has already been
+  // attenuated, so only real speech energy from the prospect crosses the threshold.
   if (data.isSpeaking) {
-    const chunkMs = audioBuffer.length / 8  // 8000 bytes/s → 8 bytes per ms
-    if (mulawRms(audioBuffer) > BARGE_IN_ENERGY_THRESHOLD) {
+    const chunkMs = cleanBuffer.length / 8  // 8000 bytes/s → 8 bytes per ms
+    if (mulawRms(cleanBuffer) > BARGE_IN_ENERGY_THRESHOLD) {
       data.vadSpeechMs += chunkMs
       if (data.vadSpeechMs >= BARGE_IN_MIN_SPEECH_MS) {
         data.vadSpeechMs = 0
-        fireBargeIn(callControlId)
+        fireBargeIn(callControlId, 'vad')
       }
     } else {
-      data.vadSpeechMs = 0  // reset on silence — prevents cumulative noise triggering
+      data.vadSpeechMs = 0
     }
   } else {
     data.vadSpeechMs = 0
@@ -195,6 +328,32 @@ export async function handleAudioChunk(callControlId: string, audioBuffer: Buffe
 async function handleProspectSpeech(callControlId: string, transcript: string) {
   const data = activeSessions.get(callControlId)
   if (!data || data.isProcessing) return
+
+  // Backchannel filter: "yeah", "uh-huh", "okay" etc. while agent is speaking
+  // are acknowledgments, not real turns. Skip LLM entirely — no response needed.
+  if (isBackchannelOnly(transcript)) {
+    console.log(`[Pipeline] Backchannel ignored: "${transcript}"`)
+    return
+  }
+
+  // Real transcript arrived — cancel any pending false barge-in recovery timer.
+  // The barge-in was genuine; the agent should not resume its previous speech.
+  if (data.falseBargeInTimer) {
+    clearTimeout(data.falseBargeInTimer)
+    data.falseBargeInTimer = null
+  }
+
+  // Resolve the pending barge-in event as 'real' — a genuine transcript confirms
+  // the barge-in was not a false positive. Store the transcript for later analysis.
+  if (data.pendingBargeInEventId) {
+    const eventId = data.pendingBargeInEventId
+    data.pendingBargeInEventId = null
+    supabase.from('barge_in_events').update({
+      outcome:     'real',
+      transcript:  transcript,
+      resolved_at: new Date().toISOString(),
+    }).eq('id', eventId).catch(err => console.error('[BargeIn] DB real-outcome update failed:', err))
+  }
 
   data.isProcessing = true
   data.bargedIn = false  // reset — new turn starting
@@ -283,6 +442,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
               if (!current?.ws || current.ws.readyState !== current.ws.OPEN) return
               if (current.bargedIn) return  // prospect interrupted — skip remaining sentences
 
+              // Track per-sentence so false barge-in recovery re-speaks the interrupted sentence.
+              current.currentSpeakingText = sentence
+
               const sentenceAbort = new AbortController()
               const sentenceMarkId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
               // Add markId to the pending set BEFORE the TTS fetch starts.
@@ -299,6 +461,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                   voiceId: ttsVoiceId,
                   text: sentence,
                   abortSignal: sentenceAbort.signal,
+                  // Fallback: if ElevenLabs returns 402/429/5xx, automatically
+                  // serve this sentence (and the rest of the call) via Deepgram Aura.
+                  fallbackApiKey: ttsProvider === 'elevenlabs' ? platformSettings.deepgram_api_key : undefined,
                   onChunk: (base64Audio) => {
                     onFirstChunk()
                     const c = activeSessions.get(callControlId)
@@ -366,6 +531,9 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
   const { session, ws, platformSettings } = data
   if (!platformSettings) return
 
+  // Track what the agent is saying so fireBargeIn can recover if it was a false interrupt.
+  data.currentSpeakingText = text
+
   session.transcript.push({ role: 'agent', text, timestamp: new Date().toISOString() })
   console.log(`[Pipeline] Agent: "${text}"`)
 
@@ -391,6 +559,8 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
       voiceId: ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined,
       text,
       abortSignal: abortController.signal,
+      // Fallback: if ElevenLabs returns 402/429/5xx, automatically serve via Deepgram Aura.
+      fallbackApiKey: ttsProvider === 'elevenlabs' ? platformSettings.deepgram_api_key : undefined,
       onChunk: (base64Audio) => {
         onFirstChunk?.()
         if (ws && ws.readyState === ws.OPEN) {
@@ -438,8 +608,18 @@ export async function endSession(callControlId: string, outcome: string) {
 
   const { session, sttStream, maxDurationTimer } = data
 
+  // Stop recording (fire-and-forget) — Telnyx finalises the file and sends
+  // call.recording.saved webhook with the download URL. 422/404 are safe to ignore.
+  if (data.platformSettings?.recording_enabled && data.platformSettings.telnyx_api_key) {
+    stopRecording(callControlId, data.platformSettings.telnyx_api_key)
+      .catch(err => console.error(`[Recording] stopRecording error ${callControlId}:`, err))
+  }
+
   if (maxDurationTimer) clearTimeout(maxDurationTimer)
+  if (data.falseBargeInTimer) clearTimeout(data.falseBargeInTimer)
   if (sttStream) sttStream.close()
+  // Free the RNNoise state for this session — prevents memory leak over many calls
+  destroyNoiseSuppressionState(data.denoisingSessionId)
 
   const durationSeconds = Math.floor(
     (Date.now() - new Date(session.startTime).getTime()) / 1000
@@ -480,7 +660,51 @@ export async function endSession(callControlId: string, outcome: string) {
     supabase.from('leads').update({ status: leadStatus }).eq('id', session.leadId),
   ])
 
+  // Batch dialer retry: if this call was part of a campaign and the outcome is
+  // retry-eligible (e.g. no_answer), reset the lead to 'pending' with a
+  // scheduled_after timestamp so the dialer picks it up again after the delay.
+  if (session.campaignId) {
+    await scheduleRetryIfNeeded(session.leadId, session.campaignId, outcome)
+      .catch(err => console.error('[Dialer] Retry scheduling error:', err))
+  }
+
   console.log(`[Pipeline] Session cleaned up: ${callControlId}`)
+}
+
+// ─── Batch dialer retry scheduling ───────────────────────────────────────────
+// Called after every campaign call ends. If the outcome matches the campaign's
+// retry_outcomes list AND retries remain, reset the lead to 'pending' with
+// scheduled_after set to now + retry_delay_minutes.
+// The dialer loop skips leads where scheduled_after > now, so the retry
+// happens automatically at the right time without any polling overhead.
+async function scheduleRetryIfNeeded(leadId: string, campaignId: string, outcome: string): Promise<void> {
+  const [{ data: campaign }, { data: lead }] = await Promise.all([
+    supabase.from('campaigns')
+      .select('retry_attempts, retry_delay_minutes, retry_outcomes')
+      .eq('id', campaignId)
+      .maybeSingle(),
+    supabase.from('leads')
+      .select('retry_count')
+      .eq('id', leadId)
+      .maybeSingle(),
+  ])
+
+  if (!campaign || !lead) return
+
+  const retryOutcomes: string[] = campaign.retry_outcomes ?? ['no_answer']
+  if (!retryOutcomes.includes(outcome)) return              // terminal outcome — no retry
+  if ((lead.retry_count ?? 0) >= campaign.retry_attempts) return  // retries exhausted
+
+  const newRetryCount  = (lead.retry_count ?? 0) + 1
+  const scheduledAfter = new Date(Date.now() + campaign.retry_delay_minutes * 60_000)
+
+  await supabase.from('leads').update({
+    status:          'pending',
+    retry_count:     newRetryCount,
+    scheduled_after: scheduledAfter.toISOString(),
+  }).eq('id', leadId)
+
+  console.log(`[Dialer] Retry ${newRetryCount}/${campaign.retry_attempts} scheduled for lead ${leadId} at ${scheduledAfter.toISOString()} (outcome: ${outcome})`)
 }
 
 // Called from index.ts when Telnyx echoes back a mark — signals true end of audio playback on the call.
@@ -492,6 +716,7 @@ export function onTelnyxMark(callControlId: string, markName: string) {
     d.pendingMarkIds.delete(markName)
     if (d.pendingMarkIds.size === 0) {
       d.isSpeaking = false
+      d.currentSpeakingText = null  // audio fully played — no recovery needed anymore
       console.log(`[Pipeline] Telnyx playback complete — last mark: ${markName}`)
     } else {
       console.log(`[Pipeline] Telnyx mark received (${d.pendingMarkIds.size} still pending): ${markName}`)

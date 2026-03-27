@@ -6,6 +6,8 @@ import {
   activeSessions, registerSession, attachWebSocket,
   startSession, handleAudioChunk, endSession, updateTelephonyCost, onTelnyxMark
 } from './agent/pipeline'
+import { startDialerLoop } from './dialer/engine'
+import { supabase } from './db/client'
 import type { CallSession } from '@voiceflow/shared'
 
 const app = express()
@@ -14,6 +16,30 @@ app.use(express.json())
 // Health check — required by Google Cloud Run
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', activeCalls: activeSessions.size, timestamp: new Date().toISOString() })
+})
+
+// Real-time monitoring — returns a sanitised snapshot of every live session.
+// Called every 5s by the dashboard monitoring page.
+app.get('/monitoring/live', (_req, res) => {
+  const sessions = Array.from(activeSessions.entries()).map(([ccid, d]) => ({
+    callControlId:   ccid,
+    callId:          d.session.callId,
+    leadName:        d.session.lead?.business_name ?? 'Unknown',
+    phoneNumber:     d.session.lead?.phone_number  ?? '',
+    agentName:       d.session.agent?.name         ?? 'Unknown',
+    campaignId:      d.session.campaignId          ?? null,
+    isSpeaking:      d.isSpeaking,
+    isProcessing:    d.isProcessing,
+    turnCount:       d.conversationHistory.length,
+    elapsedSeconds:  Math.floor((Date.now() - d.session.startTime.getTime()) / 1000),
+    costLlm:         d.costLlm,
+    costTts:         d.costTts,
+    costStt:         d.sttAudioBytes * (0.0077 / 60 / 8000),
+    avgLatencyMs:    d.latencyMeasurements.length
+      ? Math.round(d.latencyMeasurements.reduce((a, b) => a + b, 0) / d.latencyMeasurements.length)
+      : null,
+  }))
+  res.json({ activeCalls: sessions.length, sessions })
 })
 
 // Called by Next.js dashboard to register session before call starts
@@ -55,6 +81,23 @@ app.post('/api/webhook/telnyx', async (req, res) => {
           .catch(() => {})
       }
       break
+
+    case 'call.recording.saved': {
+      // Telnyx sends this after the recording is fully encoded and available.
+      // payload.recording_urls.mp3 contains the HTTPS download URL.
+      const ccid       = payload?.call_control_id
+      const recordingUrl = payload?.recording_urls?.mp3 || payload?.recording_urls?.wav || null
+      if (ccid && recordingUrl) {
+        await supabase.from('calls')
+          .update({ recording_url: recordingUrl, recording_status: 'available' })
+          .eq('telephony_call_id', ccid)
+          .catch(err => console.error('[Recording] Failed to save recording URL:', err))
+        console.log(`[Recording] Saved recording URL for ${ccid}: ${recordingUrl}`)
+      } else {
+        console.warn('[Recording] call.recording.saved missing call_control_id or URL', JSON.stringify(payload))
+      }
+      break
+    }
 
     case 'call.cost': {
       // Telnyx sends exact telephony charge after call ends
@@ -156,6 +199,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Running on port ${PORT}`)
   console.log(`[Server] Health: http://localhost:${PORT}/health`)
   console.log(`[Server] WebSocket: ws://localhost:${PORT}/audio`)
+
+  // Start the batch dialer loop after the server is listening.
+  // The loop polls the DB every 5s for running campaigns and dispatches calls.
+  startDialerLoop()
 })
 
 process.on('SIGTERM', () => {

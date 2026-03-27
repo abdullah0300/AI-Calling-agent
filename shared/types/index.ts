@@ -1,3 +1,23 @@
+// ─── Campaign types ───────────────────────────────────────────────────────────
+export type CampaignStatus = 'draft' | 'running' | 'paused' | 'completed'
+
+export interface Campaign {
+  id: string
+  name: string
+  agent_id: string | null
+  phone_number_id: string | null
+  status: CampaignStatus
+  max_concurrent_calls: number
+  calls_per_minute: number
+  retry_attempts: number
+  retry_delay_minutes: number
+  retry_outcomes: string[]
+  created_at: string
+  started_at: string | null
+  paused_at: string | null
+  completed_at: string | null
+}
+
 export type TelephonyProvider = 'telnyx' | 'twilio'
 export type STTProvider = 'deepgram' | 'google'
 export type TTSProvider = 'elevenlabs' | 'deepgram' | 'google'
@@ -35,6 +55,10 @@ export interface Lead {
   callback_time: string | null
   decision_maker_name: string | null
   notes: string | null
+  // Batch dialer fields (added in migration 006)
+  campaign_id: string | null
+  retry_count: number
+  scheduled_after: string | null
   created_at: string
   updated_at: string
 }
@@ -71,6 +95,7 @@ export interface Call {
   cost_tts: number | null
   cost_llm: number | null
   cost_total: number | null
+  campaign_id: string | null
 }
 
 export type CallStatus =
@@ -105,4 +130,6 @@ export interface CallSession {
   startTime: Date
   maxDuration: number
   callControlId: string
+  // Set by the batch dialer — undefined for manually initiated calls
+  campaignId?: string
 }
