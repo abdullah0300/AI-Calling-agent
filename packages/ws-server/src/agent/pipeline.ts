@@ -108,6 +108,14 @@ interface ActiveSession {
   // RNNoise denoising state handle for this session — one stateful handle per call so
   // the recurrent network can track noise profile across frames.
   denoisingSessionId: string
+  // False interruption recovery (Item 3):
+  // Stores the text the agent was speaking when barge-in fired so we can resume
+  // if no real transcript arrives within the recovery window.
+  currentSpeakingText: string | null
+  // Timer ID for the false barge-in recovery window (2.5s).
+  // Cancelled immediately when a real transcript arrives in handleProspectSpeech.
+  // Fires speakToProspect with currentSpeakingText if the window expires without a transcript.
+  falseBargeInTimer: NodeJS.Timeout | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -124,6 +132,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
     isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
     pendingMarkIds: new Set<string>(), vadSpeechMs: 0, denoisingSessionId,
+    currentSpeakingText: null, falseBargeInTimer: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -139,10 +148,17 @@ export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?:
 
 // Central barge-in handler — called by both the STT onSpeechStarted callback AND the local VAD.
 // Immediately stops TTS, clears all pending marks, and clears Telnyx's audio buffer.
+// Starts a 2.5s false-barge-in recovery timer: if no real transcript arrives within
+// that window (meaning the barge-in was triggered by noise, not actual speech),
+// the agent resumes speaking from where it left off.
 function fireBargeIn(callControlId: string): void {
   const d = activeSessions.get(callControlId)
   if (!d || !d.isSpeaking) return
   console.log(`[Pipeline] Barge-in detected — aborting TTS ${callControlId}`)
+
+  // Snapshot what the agent was saying so we can recover if it was a false barge-in
+  const textToRecover = d.currentSpeakingText
+
   d.bargedIn = true
   d.currentTtsAbort?.abort()
   d.currentTtsAbort = null
@@ -153,6 +169,22 @@ function fireBargeIn(callControlId: string): void {
   if (d.ws && d.ws.readyState === d.ws.OPEN) {
     d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
     console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
+  }
+
+  // False barge-in recovery: if no transcript arrives within 2.5s, the interruption
+  // was caused by noise (not real speech) — resume agent audio from the saved text.
+  if (textToRecover) {
+    if (d.falseBargeInTimer) clearTimeout(d.falseBargeInTimer)
+    d.falseBargeInTimer = setTimeout(async () => {
+      d.falseBargeInTimer = null
+      const current = activeSessions.get(callControlId)
+      // Only recover if the session still exists, nothing new is processing or speaking,
+      // and the agent hasn't already started a new turn via a real transcript.
+      if (!current || current.isProcessing || current.isSpeaking) return
+      console.log(`[Pipeline] False barge-in recovery — no transcript in 2.5s, resuming: "${textToRecover}"`)
+      current.bargedIn = false
+      await speakToProspect(callControlId, textToRecover)
+    }, 2500)
   }
 }
 
@@ -253,6 +285,13 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     return
   }
 
+  // Real transcript arrived — cancel any pending false barge-in recovery timer.
+  // The barge-in was genuine; the agent should not resume its previous speech.
+  if (data.falseBargeInTimer) {
+    clearTimeout(data.falseBargeInTimer)
+    data.falseBargeInTimer = null
+  }
+
   data.isProcessing = true
   data.bargedIn = false  // reset — new turn starting
   const turnStart = Date.now()
@@ -340,6 +379,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
               if (!current?.ws || current.ws.readyState !== current.ws.OPEN) return
               if (current.bargedIn) return  // prospect interrupted — skip remaining sentences
 
+              // Track per-sentence so false barge-in recovery re-speaks the interrupted sentence.
+              current.currentSpeakingText = sentence
+
               const sentenceAbort = new AbortController()
               const sentenceMarkId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
               // Add markId to the pending set BEFORE the TTS fetch starts.
@@ -423,6 +465,9 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
   const { session, ws, platformSettings } = data
   if (!platformSettings) return
 
+  // Track what the agent is saying so fireBargeIn can recover if it was a false interrupt.
+  data.currentSpeakingText = text
+
   session.transcript.push({ role: 'agent', text, timestamp: new Date().toISOString() })
   console.log(`[Pipeline] Agent: "${text}"`)
 
@@ -496,6 +541,7 @@ export async function endSession(callControlId: string, outcome: string) {
   const { session, sttStream, maxDurationTimer } = data
 
   if (maxDurationTimer) clearTimeout(maxDurationTimer)
+  if (data.falseBargeInTimer) clearTimeout(data.falseBargeInTimer)
   if (sttStream) sttStream.close()
   // Free the RNNoise state for this session — prevents memory leak over many calls
   destroyNoiseSuppressionState(data.denoisingSessionId)
@@ -551,6 +597,7 @@ export function onTelnyxMark(callControlId: string, markName: string) {
     d.pendingMarkIds.delete(markName)
     if (d.pendingMarkIds.size === 0) {
       d.isSpeaking = false
+      d.currentSpeakingText = null  // audio fully played — no recovery needed anymore
       console.log(`[Pipeline] Telnyx playback complete — last mark: ${markName}`)
     } else {
       console.log(`[Pipeline] Telnyx mark received (${d.pendingMarkIds.size} still pending): ${markName}`)
