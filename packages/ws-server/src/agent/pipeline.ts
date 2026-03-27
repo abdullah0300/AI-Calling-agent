@@ -23,12 +23,37 @@ initNoiseSuppression()
 const DEEPGRAM_STT_PER_BYTE = 0.0077 / 60 / 8000  // $0.0077/min ÷ 60s ÷ 8000 bytes/s (mulaw 8kHz)
 
 // ─── Local VAD constants for fast barge-in ───────────────────────────────────
-// Vapi/LiveKit detect barge-in in ~80ms using raw audio energy (VAD), not by waiting
-// for the STT model to make a decision. We mirror this with a simple energy threshold.
-// Telnyx sends mulaw 8kHz. When decoded to linear16: silence ~0-200 RMS, noise ~200-600,
-// speech ~600-5000. We require sustained speech (150ms) above threshold to fire barge-in.
-const BARGE_IN_ENERGY_THRESHOLD = 600   // RMS of decoded linear16 — above this = likely speech
-const BARGE_IN_MIN_SPEECH_MS    = 150   // ms of sustained speech before triggering barge-in
+// After RNNoise denoising, audio reaching this VAD is already cleaned.
+// Threshold raised from 600 → 2000: on a denoised signal, real speech from the
+// prospect sits at 1500-5000 RMS while residual noise stays below 1000.
+// Min duration raised from 150ms → 500ms: matches LiveKit/BytePlus industry
+// standard — filters coughs, door slams, and short background bursts that a
+// denoiser can't fully eliminate.
+const BARGE_IN_ENERGY_THRESHOLD = 2000  // RMS of decoded linear16 — above this = likely speech
+const BARGE_IN_MIN_SPEECH_MS    = 500   // ms of sustained speech before triggering barge-in
+
+// ─── Backchannel detection ────────────────────────────────────────────────────
+// Backchannel utterances ("yeah", "uh-huh", "okay") are acknowledgment sounds
+// the prospect makes WHILE the agent is speaking. They are NOT interruptions and
+// should NOT trigger a full LLM response. This list covers the most common ones.
+const BACKCHANNEL_WORDS = new Set([
+  'yeah', 'yes', 'yep', 'yup', 'ya',
+  'uh-huh', 'mm-hmm', 'mhm', 'mm', 'hmm', 'hm',
+  'ok', 'okay',
+  'alright', 'alright.', 'right',
+  'sure', 'got it',
+  'i see', 'oh', 'ah',
+  'uh', 'um',
+  'cool', 'great', 'fine',
+])
+
+// Returns true when every word in text is a backchannel acknowledgment.
+// Used to ignore filler responses that don't warrant an agent reply.
+function isBackchannelOnly(text: string): boolean {
+  const words = text.toLowerCase().replace(/[.,!?]/g, '').trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0 || words.length > 4) return false  // >4 words = real speech
+  return words.every(w => BACKCHANNEL_WORDS.has(w))
+}
 
 // Decodes a mulaw 8kHz buffer and returns its RMS energy (linear16 scale).
 // Used by local VAD to detect prospect speech during agent audio playback.
@@ -220,6 +245,13 @@ export async function handleAudioChunk(callControlId: string, audioBuffer: Buffe
 async function handleProspectSpeech(callControlId: string, transcript: string) {
   const data = activeSessions.get(callControlId)
   if (!data || data.isProcessing) return
+
+  // Backchannel filter: "yeah", "uh-huh", "okay" etc. while agent is speaking
+  // are acknowledgments, not real turns. Skip LLM entirely — no response needed.
+  if (isBackchannelOnly(transcript)) {
+    console.log(`[Pipeline] Backchannel ignored: "${transcript}"`)
+    return
+  }
 
   data.isProcessing = true
   data.bargedIn = false  // reset — new turn starting

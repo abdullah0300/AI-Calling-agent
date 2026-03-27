@@ -64,6 +64,23 @@ function createFluxStream(config: STTStreamConfig) {
     console.log('[STT/Flux] Connected to Deepgram v2/listen')
   })
 
+  // Pending barge-in timer — StartOfTurn fires a 250ms confirmation window.
+  // If the first partial transcript within that window is only backchannel words
+  // ("yeah", "uh-huh") we cancel and don't interrupt the agent.
+  // If 250ms passes with no cancellation, the barge-in fires.
+  let bargeInTimer: ReturnType<typeof setTimeout> | null = null
+
+  const BACKCHANNEL = new Set([
+    'yeah', 'yes', 'yep', 'yup', 'ya',
+    'uh-huh', 'mm-hmm', 'mhm', 'mm', 'hmm', 'hm',
+    'ok', 'okay', 'alright', 'right',
+    'sure', 'oh', 'ah', 'uh', 'um', 'cool', 'great', 'fine',
+  ])
+  function isBackchannel(text: string): boolean {
+    const words = text.toLowerCase().replace(/[.,!?]/g, '').trim().split(/\s+/).filter(Boolean)
+    return words.length > 0 && words.length <= 4 && words.every(w => BACKCHANNEL.has(w))
+  }
+
   ws.on('message', (raw: Buffer) => {
     let msg: any
     try { msg = JSON.parse(raw.toString()) } catch { return }
@@ -74,13 +91,30 @@ function createFluxStream(config: STTStreamConfig) {
     const transcript = (msg.transcript as string | undefined)?.trim()
 
     if (event === 'EndOfTurn' && transcript && transcript.length > 2) {
-      // Final transcript — send to LLM pipeline
+      // Cancel any pending barge-in timer — turn has ended cleanly
+      if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null }
       config.onTranscript(transcript, true)
+
     } else if (event === 'StartOfTurn') {
-      // Prospect started speaking — trigger barge-in if agent is speaking
-      config.onSpeechStarted?.()
+      // Don't fire barge-in immediately — wait 250ms for a partial transcript.
+      // If the partial shows only backchannel words, the prospect is just
+      // acknowledging, not actually interrupting. Cancel and don't stop agent.
+      if (bargeInTimer) return  // already pending
+      bargeInTimer = setTimeout(() => {
+        bargeInTimer = null
+        config.onSpeechStarted?.()
+      }, 250)
+
+    } else if ((event === 'Update' || event === 'EagerEndOfTurn') && transcript && bargeInTimer) {
+      // Partial transcript arrived within the 250ms window.
+      // If it's only backchannel words — cancel the pending barge-in.
+      if (isBackchannel(transcript)) {
+        clearTimeout(bargeInTimer)
+        bargeInTimer = null
+        console.log(`[STT/Flux] Backchannel detected in StartOfTurn window — barge-in cancelled: "${transcript}"`)
+      }
+      // Non-backchannel partial → let the timer fire naturally (250ms)
     }
-    // Update events (interim) and EagerEndOfTurn are ignored for now
   })
 
   ws.on('error', (err: Error) => {
@@ -113,6 +147,7 @@ function createFluxStream(config: STTStreamConfig) {
     },
     close: () => {
       clearInterval(keepAlive)
+      if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null }
       if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'session ended')
     },
   }
