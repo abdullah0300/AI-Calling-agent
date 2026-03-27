@@ -182,21 +182,19 @@ function fireBargeIn(callControlId: string, source: 'vad' | 'stt'): void {
 
   // Log the barge-in event to DB — fire-and-forget, non-blocking.
   // The outcome starts as 'pending' and is resolved to 'real' or 'false' below.
-  supabase.from('barge_in_events').insert({
-    call_id:   d.session.callId,
-    fired_at:  new Date().toISOString(),
-    agent_text: textToRecover,
-    trigger:   source,
-    outcome:   'pending',
-  }).select('id').single().then(({ data, error }) => {
-    if (error) {
-      console.error('[BargeIn] DB log insert failed:', error.message)
-      return
-    }
-    // Store the row ID so the resolution step can update it
+  void Promise.resolve(
+    supabase.from('barge_in_events').insert({
+      call_id:    d.session.callId,
+      fired_at:   new Date().toISOString(),
+      agent_text: textToRecover,
+      trigger:    source,
+      outcome:    'pending',
+    }).select('id').single()
+  ).then(({ data, error }) => {
+    if (error) { console.error('[BargeIn] DB log insert failed:', error.message); return }
     const current = activeSessions.get(callControlId)
     if (current && data) current.pendingBargeInEventId = data.id
-  }).catch(err => console.error('[BargeIn] DB log insert error:', err))
+  }, err => console.error('[BargeIn] DB log insert error:', err))
 
   // False barge-in recovery: if no transcript arrives within 2.5s, the interruption
   // was caused by noise (not real speech) — resume agent audio from the saved text.
@@ -215,10 +213,9 @@ function fireBargeIn(callControlId: string, source: 'vad' | 'stt'): void {
       if (current.pendingBargeInEventId) {
         const eventId = current.pendingBargeInEventId
         current.pendingBargeInEventId = null
-        supabase.from('barge_in_events').update({
-          outcome:     'false',
-          resolved_at: new Date().toISOString(),
-        }).eq('id', eventId).catch(err => console.error('[BargeIn] DB false-outcome update failed:', err))
+        void Promise.resolve(
+          supabase.from('barge_in_events').update({ outcome: 'false', resolved_at: new Date().toISOString() }).eq('id', eventId)
+        ).then(null, err => console.error('[BargeIn] DB false-outcome update failed:', err))
       }
 
       await speakToProspect(callControlId, textToRecover)
@@ -348,11 +345,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   if (data.pendingBargeInEventId) {
     const eventId = data.pendingBargeInEventId
     data.pendingBargeInEventId = null
-    supabase.from('barge_in_events').update({
-      outcome:     'real',
-      transcript:  transcript,
-      resolved_at: new Date().toISOString(),
-    }).eq('id', eventId).catch(err => console.error('[BargeIn] DB real-outcome update failed:', err))
+    void Promise.resolve(
+      supabase.from('barge_in_events').update({ outcome: 'real', transcript, resolved_at: new Date().toISOString() }).eq('id', eventId)
+    ).then(null, err => console.error('[BargeIn] DB real-outcome update failed:', err))
   }
 
   data.isProcessing = true
