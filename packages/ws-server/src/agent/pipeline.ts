@@ -116,6 +116,11 @@ interface ActiveSession {
   // Cancelled immediately when a real transcript arrives in handleProspectSpeech.
   // Fires speakToProspect with currentSpeakingText if the window expires without a transcript.
   falseBargeInTimer: NodeJS.Timeout | null
+  // Barge-in event logging (Item 6):
+  // DB row ID of the most recent barge-in event that hasn't been resolved yet.
+  // Set asynchronously after fireBargeIn inserts the row; cleared when the
+  // outcome is determined (real or false) and the row is updated.
+  pendingBargeInEventId: string | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -132,7 +137,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
     isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
     pendingMarkIds: new Set<string>(), vadSpeechMs: 0, denoisingSessionId,
-    currentSpeakingText: null, falseBargeInTimer: null,
+    currentSpeakingText: null, falseBargeInTimer: null, pendingBargeInEventId: null,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -151,10 +156,11 @@ export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?:
 // Starts a 2.5s false-barge-in recovery timer: if no real transcript arrives within
 // that window (meaning the barge-in was triggered by noise, not actual speech),
 // the agent resumes speaking from where it left off.
-function fireBargeIn(callControlId: string): void {
+// Every firing inserts a row into barge_in_events; the outcome is resolved later.
+function fireBargeIn(callControlId: string, source: 'vad' | 'stt'): void {
   const d = activeSessions.get(callControlId)
   if (!d || !d.isSpeaking) return
-  console.log(`[Pipeline] Barge-in detected — aborting TTS ${callControlId}`)
+  console.log(`[Pipeline] Barge-in detected (${source}) — aborting TTS ${callControlId}`)
 
   // Snapshot what the agent was saying so we can recover if it was a false barge-in
   const textToRecover = d.currentSpeakingText
@@ -166,10 +172,30 @@ function fireBargeIn(callControlId: string): void {
   d.pendingMarkIds.clear()
   d.vadSpeechMs = 0
   d.isProcessing = false  // allow new speech turn to start immediately
+  d.pendingBargeInEventId = null  // reset — will be set once insert resolves
+
   if (d.ws && d.ws.readyState === d.ws.OPEN) {
     d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
     console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
   }
+
+  // Log the barge-in event to DB — fire-and-forget, non-blocking.
+  // The outcome starts as 'pending' and is resolved to 'real' or 'false' below.
+  supabase.from('barge_in_events').insert({
+    call_id:   d.session.callId,
+    fired_at:  new Date().toISOString(),
+    agent_text: textToRecover,
+    trigger:   source,
+    outcome:   'pending',
+  }).select('id').single().then(({ data, error }) => {
+    if (error) {
+      console.error('[BargeIn] DB log insert failed:', error.message)
+      return
+    }
+    // Store the row ID so the resolution step can update it
+    const current = activeSessions.get(callControlId)
+    if (current && data) current.pendingBargeInEventId = data.id
+  }).catch(err => console.error('[BargeIn] DB log insert error:', err))
 
   // False barge-in recovery: if no transcript arrives within 2.5s, the interruption
   // was caused by noise (not real speech) — resume agent audio from the saved text.
@@ -183,6 +209,17 @@ function fireBargeIn(callControlId: string): void {
       if (!current || current.isProcessing || current.isSpeaking) return
       console.log(`[Pipeline] False barge-in recovery — no transcript in 2.5s, resuming: "${textToRecover}"`)
       current.bargedIn = false
+
+      // Resolve the barge-in event as 'false' — noise triggered it, not real speech
+      if (current.pendingBargeInEventId) {
+        const eventId = current.pendingBargeInEventId
+        current.pendingBargeInEventId = null
+        supabase.from('barge_in_events').update({
+          outcome:     'false',
+          resolved_at: new Date().toISOString(),
+        }).eq('id', eventId).catch(err => console.error('[BargeIn] DB false-outcome update failed:', err))
+      }
+
       await speakToProspect(callControlId, textToRecover)
     }, 2500)
   }
@@ -233,7 +270,7 @@ export async function startSession(callControlId: string) {
     // STT-based barge-in: Deepgram fires SpeechStarted (Nova-2) or StartOfTurn (Flux)
     // when it detects the prospect starting to speak. We also run a parallel local VAD
     // in handleAudioChunk for faster (~80ms) detection independent of the STT model.
-    onSpeechStarted: () => fireBargeIn(callControlId),
+    onSpeechStarted: () => fireBargeIn(callControlId, 'stt'),
   })
 
   await speakToProspect(callControlId, session.agent.greeting_message)
@@ -264,7 +301,7 @@ export async function handleAudioChunk(callControlId: string, audioBuffer: Buffe
       data.vadSpeechMs += chunkMs
       if (data.vadSpeechMs >= BARGE_IN_MIN_SPEECH_MS) {
         data.vadSpeechMs = 0
-        fireBargeIn(callControlId)
+        fireBargeIn(callControlId, 'vad')
       }
     } else {
       data.vadSpeechMs = 0
@@ -290,6 +327,18 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   if (data.falseBargeInTimer) {
     clearTimeout(data.falseBargeInTimer)
     data.falseBargeInTimer = null
+  }
+
+  // Resolve the pending barge-in event as 'real' — a genuine transcript confirms
+  // the barge-in was not a false positive. Store the transcript for later analysis.
+  if (data.pendingBargeInEventId) {
+    const eventId = data.pendingBargeInEventId
+    data.pendingBargeInEventId = null
+    supabase.from('barge_in_events').update({
+      outcome:     'real',
+      transcript:  transcript,
+      resolved_at: new Date().toISOString(),
+    }).eq('id', eventId).catch(err => console.error('[BargeIn] DB real-outcome update failed:', err))
   }
 
   data.isProcessing = true
