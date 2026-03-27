@@ -14,6 +14,7 @@ import { supabase } from '../db/client'
 import { loadSettings } from '../db/settings'
 import { activeSessions, registerSession } from '../agent/pipeline'
 import { isWithinCallingHours, formatLocalTime } from '../utils/calling-hours'
+import { logger } from '../utils/logger'
 import type { CallSession, Lead } from '@voiceflow/shared'
 
 const TICK_INTERVAL_MS = 5_000  // how often to check for pending calls
@@ -43,7 +44,7 @@ async function dialerTick(): Promise<void> {
     // Process campaigns in parallel — each is independent
     await Promise.all(campaigns.map(c => processCampaign(c, callingHoursConfig)))
   } catch (err) {
-    console.error('[Dialer] Tick error:', err)
+    logger.error('dialer', `Tick error: ${String(err)}`)
   }
 }
 
@@ -143,7 +144,7 @@ async function dispatchNextLead(
     await placeCall(campaign, lead)
     return 'dispatched'
   } catch (err) {
-    console.error(`[Dialer] Call dispatch failed for lead ${lead.id}:`, err)
+    logger.error('dialer', `Call dispatch failed for lead ${lead.id}: ${String(err)}`, { leadId: lead.id, campaignId: campaign.id })
     // Reset lead so it can be retried on the next tick
     await supabase.from('leads').update({ status: 'pending' }).eq('id', lead.id)
     return 'lock_failed'

@@ -8,6 +8,7 @@ import {
 } from './agent/pipeline'
 import { startDialerLoop } from './dialer/engine'
 import { supabase } from './db/client'
+import { logger } from './utils/logger'
 import type { CallSession } from '@voiceflow/shared'
 
 const app = express()
@@ -70,7 +71,7 @@ app.post('/api/webhook/telnyx', async (req, res) => {
       // Prospect or agent hung up — end session cleanly
       if (payload?.call_control_id) {
         await endSession(payload.call_control_id, payload?.hangup_cause || 'completed')
-          .catch(err => console.error('[Webhook] Failed to end session on hangup:', err))
+          .catch(err => logger.error('webhook', 'Failed to end session on hangup', { error: String(err) }))
       }
       break
 
@@ -91,7 +92,7 @@ app.post('/api/webhook/telnyx', async (req, res) => {
         const { error: recErr } = await supabase.from('calls')
           .update({ recording_url: recordingUrl, recording_status: 'available' })
           .eq('telephony_call_id', ccid)
-        if (recErr) console.error('[Recording] Failed to save recording URL:', recErr.message)
+        if (recErr) logger.error('recording', 'Failed to save recording URL', { error: recErr.message })
         console.log(`[Recording] Saved recording URL for ${ccid}: ${recordingUrl}`)
       } else {
         console.warn('[Recording] call.recording.saved missing call_control_id or URL', JSON.stringify(payload))
@@ -190,7 +191,7 @@ wss.on('connection', (ws: WebSocket) => {
     }
   })
 
-  ws.on('error', (error) => console.error('[WS] Error:', error.message))
+  ws.on('error', (error) => logger.error('server', `WebSocket error: ${error.message}`))
   ws.on('pong', () => { /* connection alive */ })
 })
 
