@@ -447,6 +447,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                   voiceId: ttsVoiceId,
                   text: sentence,
                   abortSignal: sentenceAbort.signal,
+                  // Fallback: if ElevenLabs returns 402/429/5xx, automatically
+                  // serve this sentence (and the rest of the call) via Deepgram Aura.
+                  fallbackApiKey: ttsProvider === 'elevenlabs' ? platformSettings.deepgram_api_key : undefined,
                   onChunk: (base64Audio) => {
                     onFirstChunk()
                     const c = activeSessions.get(callControlId)
@@ -542,6 +545,8 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
       voiceId: ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined,
       text,
       abortSignal: abortController.signal,
+      // Fallback: if ElevenLabs returns 402/429/5xx, automatically serve via Deepgram Aura.
+      fallbackApiKey: ttsProvider === 'elevenlabs' ? platformSettings.deepgram_api_key : undefined,
       onChunk: (base64Audio) => {
         onFirstChunk?.()
         if (ws && ws.readyState === ws.OPEN) {

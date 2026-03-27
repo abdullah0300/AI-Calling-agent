@@ -25,17 +25,96 @@ export interface TTSStreamConfig extends TTSConfig {
   onChunk: (base64Audio: string) => void
   // Optional AbortSignal — abort() cancels the in-flight TTS request (used for barge-in).
   abortSignal?: AbortSignal
+  // Fallback: Deepgram API key to use if the primary provider fails with a
+  // retriable error (402 out-of-credits, 429 rate-limit, 5xx server error).
+  // When set and the circuit breaker trips, this request and all subsequent
+  // requests in the same process window are served by Deepgram Aura instead.
+  fallbackApiKey?: string
 }
 
+// ─── ElevenLabs circuit breaker ──────────────────────────────────────────────
+// Shared across all sessions in this process. When ElevenLabs returns a
+// retriable error, we open the circuit for a fixed window so subsequent
+// sentences don't retry a broken provider mid-conversation.
+//
+//  402 out-of-credits   → 5 minutes  (credits won't appear in seconds)
+//  429 rate-limit       → 60 seconds (back-off, then try again)
+//  5xx server error     → 2 minutes  (service likely recovering)
+//
+// The circuit auto-resets after the window expires — no manual intervention.
+let elevenlabsCircuitOpenUntil: number | null = null
+
+function isElevenLabsCircuitOpen(): boolean {
+  if (elevenlabsCircuitOpenUntil === null) return false
+  if (Date.now() < elevenlabsCircuitOpenUntil) return true
+  elevenlabsCircuitOpenUntil = null  // window expired — reset circuit
+  console.log('[TTS] ElevenLabs circuit reset — will retry primary provider')
+  return false
+}
+
+function tripElevenLabsCircuit(statusCode: number): void {
+  const windowMs =
+    statusCode === 429         ?  60_000 :   // rate limit: back off 1 min
+    statusCode === 402         ? 300_000 :   // out of credits: 5 min
+    /* 500/502/503/504 */        120_000      // server error: 2 min
+  elevenlabsCircuitOpenUntil = Date.now() + windowMs
+  console.warn(`[TTS] ElevenLabs circuit opened (status ${statusCode}) — fallback active until ${new Date(elevenlabsCircuitOpenUntil).toISOString()}`)
+}
+
+// Status codes that warrant a fallback — not permanent auth failures.
+// 401 = bad key (fallback won't fix config); 422 = bad payload (same).
+function isFallbackEligibleStatus(status: number): boolean {
+  return status === 402 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+}
+
+// Custom error so the circuit breaker can inspect the HTTP status code.
+class TTSProviderError extends Error {
+  constructor(message: string, public readonly statusCode: number) {
+    super(message)
+    this.name = 'TTSProviderError'
+  }
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 // Streams TTS audio chunks as they arrive, calling onChunk for each.
-// Returns costUsd. Throws on provider error.
+// Returns costUsd. Throws on unrecoverable provider error.
+// When provider='elevenlabs' and fallbackApiKey is set, automatically falls
+// back to Deepgram Aura on retriable failures.
 export async function streamTextToSpeech(config: TTSStreamConfig): Promise<number> {
   switch (config.provider) {
-    case 'elevenlabs': return elevenLabsStreamingTTS(config)
-    case 'deepgram':   return deepgramStreamingTTS(config)
+    case 'elevenlabs': {
+      // If the circuit is already open (previous failure in this process window),
+      // skip ElevenLabs entirely and serve Deepgram immediately.
+      if (isElevenLabsCircuitOpen() && config.fallbackApiKey) {
+        console.log('[TTS] ElevenLabs circuit open — using Deepgram Aura fallback')
+        return deepgramStreamingTTS({ ...config, apiKey: config.fallbackApiKey, voiceId: 'aura-asteria-en' })
+      }
+      try {
+        return await elevenLabsStreamingTTS(config)
+      } catch (err) {
+        // Only fall back if the error carries an eligible HTTP status AND
+        // a fallback key is available AND no audio chunks have been sent yet
+        // (i.e., the error fired before streaming started — mid-stream abort
+        // errors are AbortErrors handled inside elevenLabsStreamingTTS itself).
+        if (
+          err instanceof TTSProviderError &&
+          isFallbackEligibleStatus(err.statusCode) &&
+          config.fallbackApiKey
+        ) {
+          tripElevenLabsCircuit(err.statusCode)
+          console.warn(`[TTS] ElevenLabs ${err.statusCode} — falling back to Deepgram Aura for: "${config.text.slice(0, 60)}…"`)
+          return deepgramStreamingTTS({ ...config, apiKey: config.fallbackApiKey, voiceId: 'aura-asteria-en' })
+        }
+        throw err  // non-retriable (401 bad key, 422 bad payload, AbortError, etc.)
+      }
+    }
+    case 'deepgram': return deepgramStreamingTTS(config)
     default: throw new Error(`Streaming TTS not implemented for provider: ${config.provider}`)
   }
 }
+
+// ─── ElevenLabs streaming ─────────────────────────────────────────────────────
 
 async function elevenLabsStreamingTTS(config: TTSStreamConfig): Promise<number> {
   const voiceId = config.voiceId || '21m00Tcm4TlvDq8ikWAM'
@@ -73,11 +152,12 @@ async function elevenLabsStreamingTTS(config: TTSStreamConfig): Promise<number> 
     } catch {}
     const reason =
       response.status === 401 ? 'Invalid or missing ElevenLabs API key.' :
-      response.status === 402 ? 'ElevenLabs account has insufficient credits or the plan does not support this voice. Please top up your account or upgrade your plan at elevenlabs.io.' :
+      response.status === 402 ? 'ElevenLabs account has insufficient credits or the plan does not support this voice.' :
       response.status === 422 ? `ElevenLabs rejected the request — ${detail}` :
-      response.status === 429 ? 'ElevenLabs rate limit reached. Too many requests in a short period.' :
-      `ElevenLabs returned an unexpected error (HTTP ${response.status}) — ${detail}`
-    throw new Error(reason)
+      response.status === 429 ? 'ElevenLabs rate limit reached.' :
+      `ElevenLabs HTTP ${response.status} — ${detail}`
+    // Use TTSProviderError so the circuit breaker in streamTextToSpeech can read the status code
+    throw new TTSProviderError(reason, response.status)
   }
 
   if (!response.body) throw new Error('ElevenLabs streaming TTS: no response body')
@@ -99,6 +179,8 @@ async function elevenLabsStreamingTTS(config: TTSStreamConfig): Promise<number> 
 
   return config.text.length * ELEVENLABS_PER_CHAR
 }
+
+// ─── Deepgram Aura streaming ──────────────────────────────────────────────────
 
 async function deepgramStreamingTTS(config: TTSStreamConfig): Promise<number> {
   const voice = config.voiceId || 'aura-asteria-en'
@@ -137,6 +219,8 @@ async function deepgramStreamingTTS(config: TTSStreamConfig): Promise<number> {
   return config.text.length * DEEPGRAM_TTS_PER_CHAR
 }
 
+// ─── Non-streaming (batch) TTS ────────────────────────────────────────────────
+
 export async function textToSpeech(config: TTSConfig): Promise<TTSResult> {
   switch (config.provider) {
     case 'elevenlabs': return elevenLabsTTS(config)
@@ -152,14 +236,9 @@ async function elevenLabsTTS(config: TTSConfig): Promise<TTSResult> {
     `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
     {
       method: 'POST',
-      headers: {
-        'xi-api-key': config.apiKey,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'xi-api-key': config.apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: config.text,
-        // eleven_flash_v2_5 = lowest latency ElevenLabs model at 75ms
-        // Do NOT use eleven_multilingual_v2 — 400ms+ latency breaks conversations
         model_id: 'eleven_flash_v2_5',
         voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.0, use_speaker_boost: true },
         output_format: 'mp3_44100_128',
@@ -176,10 +255,10 @@ async function elevenLabsTTS(config: TTSConfig): Promise<TTSResult> {
     } catch {}
     const reason =
       response.status === 401 ? 'Invalid or missing ElevenLabs API key.' :
-      response.status === 402 ? 'ElevenLabs account has insufficient credits or the plan does not support this voice. Please top up your account or upgrade your plan at elevenlabs.io.' :
+      response.status === 402 ? 'ElevenLabs account has insufficient credits or the plan does not support this voice.' :
       response.status === 422 ? `ElevenLabs rejected the request — ${detail}` :
-      response.status === 429 ? 'ElevenLabs rate limit reached. Too many requests in a short period.' :
-      `ElevenLabs returned an unexpected error (HTTP ${response.status}) — ${detail}`
+      response.status === 429 ? 'ElevenLabs rate limit reached.' :
+      `ElevenLabs HTTP ${response.status} — ${detail}`
     throw new Error(reason)
   }
 
