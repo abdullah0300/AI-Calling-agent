@@ -30,7 +30,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       <aside className={cn(
         'fixed inset-y-0 left-0 z-50 w-64 bg-slate-900 text-white flex flex-col',
         'transform transition-transform duration-200 ease-in-out',
-        'md:relative md:translate-x-0',
+        'md:sticky md:top-0 md:h-screen md:translate-x-0 md:shrink-0',
         mobileOpen ? 'translate-x-0' : '-translate-x-full'
       )}>
         {/* Brand */}
