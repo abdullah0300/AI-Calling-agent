@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Phone, Bot, BarChart3, Settings, Menu, X, Zap, ChevronRight, Users, Activity } from 'lucide-react'
+import { Phone, Bot, BarChart3, Settings, Menu, X, Zap, ChevronRight, Users, Activity, ScrollText } from 'lucide-react'
 import { useState } from 'react'
 import { cn } from '@/lib/utils'
 
@@ -11,8 +11,9 @@ const navItems = [
   { href: '/agents',  label: 'Agents',    icon: Bot,       description: 'Manage AI calling agents' },
   { href: '/leads',   label: 'Leads',     icon: Users,     description: 'Manage and import leads' },
   { href: '/calls',      label: 'Calls',       icon: Phone,     description: 'Full call history' },
-  { href: '/monitoring', label: 'Monitoring',  icon: Activity,  description: 'Live calls & campaign stats' },
-  { href: '/settings',   label: 'Settings',    icon: Settings,  description: 'API keys & providers' },
+  { href: '/monitoring', label: 'Monitoring',  icon: Activity,    description: 'Live calls & campaign stats' },
+  { href: '/logs',       label: 'Logs',        icon: ScrollText,  description: 'Server errors & warnings' },
+  { href: '/settings',   label: 'Settings',    icon: Settings,    description: 'API keys & providers' },
 ]
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
@@ -29,7 +30,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       <aside className={cn(
         'fixed inset-y-0 left-0 z-50 w-64 bg-slate-900 text-white flex flex-col',
         'transform transition-transform duration-200 ease-in-out',
-        'md:relative md:translate-x-0',
+        'md:sticky md:top-0 md:h-screen md:translate-x-0 md:shrink-0',
         mobileOpen ? 'translate-x-0' : '-translate-x-full'
       )}>
         {/* Brand */}

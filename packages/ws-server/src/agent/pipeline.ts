@@ -11,6 +11,7 @@ import {
   denoiseAudioChunk,
 } from '../providers/noise-suppression'
 import { startRecording, stopRecording } from '../providers/recording'
+import { logger } from '../utils/logger'
 import type { PlatformSettings } from '../db/settings'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
 import type WebSocket from 'ws'
@@ -247,7 +248,7 @@ export async function startSession(callControlId: string) {
           .update({ recording_status: 'in_progress' })
           .eq('id', session.callId)
       })
-      .catch(err => console.error(`[Recording] Failed to start recording ${callControlId}:`, err))
+      .catch(err => logger.error('recording', `Failed to start recording: ${String(err)}`, { callId: session.callId }))
   }
 
   await supabase.from('calls')
@@ -277,7 +278,7 @@ export async function startSession(callControlId: string) {
     onTranscript: async (text, isFinal) => {
       if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
     },
-    onError: (error) => console.error(`[Pipeline] STT error ${callControlId}:`, error),
+    onError: (error) => logger.error('stt', `STT error: ${error.message}`, { callId: data.session.callId }),
     // STT-based barge-in: Deepgram fires SpeechStarted (Nova-2) or StartOfTurn (Flux)
     // when it detects the prospect starting to speak. We also run a parallel local VAD
     // in handleAudioChunk for faster (~80ms) detection independent of the STT model.
@@ -475,7 +476,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
                 }
               } catch (ttsErr) {
                 if (!(ttsErr instanceof Error && ttsErr.name === 'AbortError')) {
-                  console.error(`[Pipeline] TTS stream error for sentence — ${ttsErr}`)
+                  logger.error('tts', `TTS stream error: ${ttsErr}`, { callId: data?.session?.callId })
                 }
                 // On abort (barge-in already cleared the set) or error — remove this mark
                 if (current.currentTtsAbort === sentenceAbort) {
@@ -498,7 +499,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
           session.transcript.push({ role: 'agent', text: responseText, timestamp: new Date().toISOString() })
           console.log(`[Pipeline] Agent: "${responseText}"`)
         } catch (llmError) {
-          console.error(`[Pipeline] LLM error ${callControlId}:`, llmError)
+          logger.error('pipeline', `LLM error: ${llmError}`, { callId: session.callId })
           responseText = "Could you repeat that? I did not quite catch it."
           await speakToProspect(callControlId, responseText)
         }
@@ -513,7 +514,7 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     }
 
   } catch (error) {
-    console.error(`[Pipeline] Speech handling error ${callControlId}:`, error)
+    logger.error('pipeline', `Speech handling error: ${error}`, { callId: activeSessions.get(callControlId)?.session?.callId })
   } finally {
     data.isProcessing = false
   }
@@ -577,7 +578,7 @@ async function speakToProspect(callControlId: string, text: string, onFirstChunk
       return  // barge-in already cleared the Set via fireBargeIn — don't end the call
     }
     const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
-    console.error(`[Pipeline] TTS failed — ending call ${callControlId}: ${msg}`)
+    logger.error('tts', `TTS failed — ending call: ${msg}`, { callId: data.session?.callId })
     // Remove this mark since no audio was sent and no mark event will arrive from Telnyx
     data.pendingMarkIds.delete(markId)
     if (data.pendingMarkIds.size === 0) data.isSpeaking = false
@@ -607,7 +608,7 @@ export async function endSession(callControlId: string, outcome: string) {
   // call.recording.saved webhook with the download URL. 422/404 are safe to ignore.
   if (data.platformSettings?.recording_enabled && data.platformSettings.telnyx_api_key) {
     stopRecording(callControlId, data.platformSettings.telnyx_api_key)
-      .catch(err => console.error(`[Recording] stopRecording error ${callControlId}:`, err))
+      .catch(err => logger.error('recording', `stopRecording error: ${String(err)}`, { callId: data.session?.callId }))
   }
 
   if (maxDurationTimer) clearTimeout(maxDurationTimer)
