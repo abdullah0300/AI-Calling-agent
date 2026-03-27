@@ -4,9 +4,19 @@ import { streamAgentResponse } from '../providers/llm'
 import { detectScenario, buildSystemPrompt } from './scenarios'
 import { supabase } from '../db/client'
 import { loadSettings } from '../db/settings'
+import {
+  initNoiseSuppression,
+  createNoiseSuppressionState,
+  destroyNoiseSuppressionState,
+  denoiseAudioChunk,
+} from '../providers/noise-suppression'
 import type { PlatformSettings } from '../db/settings'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
 import type WebSocket from 'ws'
+
+// Initialise RNNoise WASM once at module load — all sessions share the same module.
+// Sessions each get their own stateful RNNoise handle (createNoiseSuppressionState).
+initNoiseSuppression()
 
 // Deepgram Nova-3 streaming rate (2026): $0.0077 / min
 // (source: deepgram.com/pricing)
@@ -70,17 +80,25 @@ interface ActiveSession {
   // Accumulated ms of audio above speech-energy threshold — for local VAD barge-in detection.
   // Reset to 0 when energy drops below threshold or barge-in fires.
   vadSpeechMs: number
+  // RNNoise denoising state handle for this session — one stateful handle per call so
+  // the recurrent network can track noise profile across frames.
+  denoisingSessionId: string
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
 
 export function registerSession(callControlId: string, session: CallSession) {
+  // Create a unique ID for this session's RNNoise state.
+  // The state must exist before the first audio chunk arrives.
+  const denoisingSessionId = `ns_${callControlId}`
+  createNoiseSuppressionState(denoisingSessionId)
+
   activeSessions.set(callControlId, {
     session, ws: null, sttStream: null,
     conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
     costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
     isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
-    pendingMarkIds: new Set<string>(), vadSpeechMs: 0,
+    pendingMarkIds: new Set<string>(), vadSpeechMs: 0, denoisingSessionId,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
@@ -168,24 +186,31 @@ export async function startSession(callControlId: string) {
 export async function handleAudioChunk(callControlId: string, audioBuffer: Buffer) {
   const data = activeSessions.get(callControlId)
   if (!data?.sttStream) return
-  // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
-  data.sttAudioBytes += audioBuffer.length
-  data.sttStream.sendAudio(audioBuffer)
 
-  // ── Local VAD barge-in (runs on every audio chunk while agent is speaking) ──
-  // Vapi/LiveKit detect interruptions in ~80ms via raw audio energy, not by waiting
-  // for the STT model to make a decision. This mirrors that approach.
-  // Only active when isSpeaking=true — no point running when agent is silent.
+  // ── Noise suppression (RNNoise) ───────────────────────────────────────────
+  // Clean the audio BEFORE it reaches VAD or STT. This is the core fix for
+  // false barge-ins triggered by background noise (HVAC, traffic, TV audio).
+  // denoiseAudioChunk falls back to the original buffer if WASM isn't loaded.
+  const cleanBuffer = denoiseAudioChunk(data.denoisingSessionId, audioBuffer)
+
+  // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
+  data.sttAudioBytes += cleanBuffer.length
+  // Send denoised audio to STT — Deepgram sees cleaner signal, fewer false starts
+  data.sttStream.sendAudio(cleanBuffer)
+
+  // ── Local VAD barge-in (runs on denoised audio while agent is speaking) ───
+  // Energy VAD now operates on cleaned audio — background noise has already been
+  // attenuated, so only real speech energy from the prospect crosses the threshold.
   if (data.isSpeaking) {
-    const chunkMs = audioBuffer.length / 8  // 8000 bytes/s → 8 bytes per ms
-    if (mulawRms(audioBuffer) > BARGE_IN_ENERGY_THRESHOLD) {
+    const chunkMs = cleanBuffer.length / 8  // 8000 bytes/s → 8 bytes per ms
+    if (mulawRms(cleanBuffer) > BARGE_IN_ENERGY_THRESHOLD) {
       data.vadSpeechMs += chunkMs
       if (data.vadSpeechMs >= BARGE_IN_MIN_SPEECH_MS) {
         data.vadSpeechMs = 0
         fireBargeIn(callControlId)
       }
     } else {
-      data.vadSpeechMs = 0  // reset on silence — prevents cumulative noise triggering
+      data.vadSpeechMs = 0
     }
   } else {
     data.vadSpeechMs = 0
@@ -440,6 +465,8 @@ export async function endSession(callControlId: string, outcome: string) {
 
   if (maxDurationTimer) clearTimeout(maxDurationTimer)
   if (sttStream) sttStream.close()
+  // Free the RNNoise state for this session — prevents memory leak over many calls
+  destroyNoiseSuppressionState(data.denoisingSessionId)
 
   const durationSeconds = Math.floor(
     (Date.now() - new Date(session.startTime).getTime()) / 1000

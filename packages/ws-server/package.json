@@ -9,6 +9,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
     "@deepgram/sdk": "^3.0.0",
+    "@jitsi/rnnoise-wasm": "^0.2.1",
     "@supabase/supabase-js": "latest",
     "@voiceflow/shared": "workspace:*",
     "dotenv": "^16.0.0",
