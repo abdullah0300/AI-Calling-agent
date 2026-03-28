@@ -14,6 +14,8 @@ export interface PlatformSettings {
   deepgram_api_key: string
   elevenlabs_api_key: string
   elevenlabs_voice_id: string
+  cartesia_api_key: string
+  cartesia_voice_id: string
   telnyx_api_key: string
   telnyx_connection_id: string
   // Calling hours enforcement (Item 8)
@@ -47,6 +49,8 @@ export async function loadSettings(): Promise<PlatformSettings> {
     deepgram_api_key:     map.deepgram_api_key     || process.env.DEEPGRAM_API_KEY     || '',
     elevenlabs_api_key:   map.elevenlabs_api_key   || process.env.ELEVENLABS_API_KEY   || '',
     elevenlabs_voice_id:  map.elevenlabs_voice_id  || process.env.ELEVENLABS_VOICE_ID  || '21m00Tcm4TlvDq8ikWAM',
+    cartesia_api_key:     map.cartesia_api_key     || process.env.CARTESIA_API_KEY     || '',
+    cartesia_voice_id:    map.cartesia_voice_id    || process.env.CARTESIA_VOICE_ID    || 'a0e99841-438c-4a64-b679-ae501e7d6091',
     telnyx_api_key:       map.telnyx_api_key       || process.env.TELNYX_API_KEY       || '',
     telnyx_connection_id: map.telnyx_connection_id || process.env.TELNYX_CONNECTION_ID || '',
     calling_hours_enabled: (map.calling_hours_enabled ?? 'true') !== 'false',

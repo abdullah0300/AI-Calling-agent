@@ -17,7 +17,7 @@
 //     on 402 / 429 / 5xx errors.
 
 export interface TTSConfig {
-  provider: 'elevenlabs' | 'deepgram' | 'google'
+  provider: 'elevenlabs' | 'deepgram' | 'google' | 'cartesia'
   apiKey: string
   voiceId?: string
   text: string
@@ -29,8 +29,9 @@ export interface TTSResult {
 }
 
 // 2026 rates
-const ELEVENLABS_PER_CHAR  = 0.30  / 1_000   // $0.30 / 1K chars (Creator plan)
+const ELEVENLABS_PER_CHAR   = 0.30  / 1_000  // $0.30  / 1K chars (Creator plan)
 const DEEPGRAM_TTS_PER_CHAR = 0.030 / 1_000  // $0.030 / 1K chars
+const CARTESIA_PER_CHAR     = 0.038 / 1_000  // $0.038 / 1K chars (Sonic-3)
 
 export interface TTSStreamConfig extends TTSConfig {
   onChunk: (base64Audio: string) => void
@@ -93,7 +94,8 @@ export async function streamTextToSpeech(config: TTSStreamConfig): Promise<numbe
         throw err
       }
     }
-    case 'deepgram': return deepgramStreamingTTS(config)
+    case 'deepgram':  return deepgramStreamingTTS(config)
+    case 'cartesia':  return cartesiaStreamingTTS(config)
     default: throw new Error(`Streaming TTS not implemented for provider: ${config.provider}`)
   }
 }
@@ -201,11 +203,80 @@ async function deepgramStreamingTTS(config: TTSStreamConfig): Promise<number> {
   return config.text.length * DEEPGRAM_TTS_PER_CHAR
 }
 
+// ─── Cartesia Sonic-3 streaming (SSE) ────────────────────────────────────────
+// Uses the /tts/sse HTTP endpoint — same base64 chunk pattern as ElevenLabs.
+// Output: mp3 at 44100Hz to match Telnyx stream_bidirectional_mode: 'mp3'.
+// Default voice: Barbershop Man (a0e99841) — override via cartesia_voice_id in Settings.
+async function cartesiaStreamingTTS(config: TTSStreamConfig): Promise<number> {
+  const voiceId = config.voiceId || 'a0e99841-438c-4a64-b679-ae501e7d6091'
+
+  let response: Response
+  try {
+    response = await fetch('https://api.cartesia.ai/tts/sse', {
+      method: 'POST',
+      headers: {
+        'X-API-Key':        config.apiKey,
+        'Cartesia-Version': '2025-04-16',
+        'Content-Type':     'application/json',
+      },
+      body: JSON.stringify({
+        transcript:    config.text,
+        model_id:      'sonic-3',
+        voice:         { mode: 'id', id: voiceId },
+        language:      'en',
+        output_format: { container: 'mp3', sample_rate: 44100, bit_rate: 128000 },
+      }),
+      signal: config.abortSignal,
+    })
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return 0
+    throw err
+  }
+
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`Cartesia TTS failed: ${response.status} ${body}`)
+  }
+  if (!response.body) throw new Error('Cartesia TTS: no response body')
+
+  // SSE stream: each event is a line starting with "data: " containing JSON
+  const reader  = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (config.abortSignal?.aborted) break
+
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''  // keep any incomplete trailing line
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const json = line.slice(6).trim()
+        if (!json) continue
+        try {
+          const msg = JSON.parse(json)
+          if (msg.type === 'chunk' && msg.data) config.onChunk(msg.data as string)
+        } catch { /* skip malformed SSE line */ }
+      }
+    }
+  } catch (err: any) {
+    if (err?.name !== 'AbortError') throw err
+  }
+
+  return config.text.length * CARTESIA_PER_CHAR
+}
+
 // ─── Non-streaming (batch) TTS ────────────────────────────────────────────────
 export async function textToSpeech(config: TTSConfig): Promise<TTSResult> {
   switch (config.provider) {
     case 'elevenlabs': return elevenLabsBatchTTS(config)
     case 'deepgram':   return deepgramBatchTTS(config)
+    case 'cartesia':   return cartesiaBatchTTS(config)
     default: throw new Error(`TTS provider ${config.provider} not implemented`)
   }
 }
@@ -231,6 +302,28 @@ async function elevenLabsBatchTTS(config: TTSConfig): Promise<TTSResult> {
   }
   const audio  = Buffer.from(await response.arrayBuffer()).toString('base64')
   return { audio, costUsd: config.text.length * ELEVENLABS_PER_CHAR }
+}
+
+async function cartesiaBatchTTS(config: TTSConfig): Promise<TTSResult> {
+  const voiceId  = config.voiceId || 'a0e99841-438c-4a64-b679-ae501e7d6091'
+  const response = await fetch('https://api.cartesia.ai/tts/bytes', {
+    method:  'POST',
+    headers: {
+      'X-API-Key':        config.apiKey,
+      'Cartesia-Version': '2025-04-16',
+      'Content-Type':     'application/json',
+    },
+    body: JSON.stringify({
+      transcript:    config.text,
+      model_id:      'sonic-3',
+      voice:         { mode: 'id', id: voiceId },
+      language:      'en',
+      output_format: { container: 'mp3', sample_rate: 44100, bit_rate: 128000 },
+    }),
+  })
+  if (!response.ok) throw new Error(`Cartesia TTS failed: ${response.status} ${await response.text()}`)
+  const audio = Buffer.from(await response.arrayBuffer()).toString('base64')
+  return { audio, costUsd: config.text.length * CARTESIA_PER_CHAR }
 }
 
 async function deepgramBatchTTS(config: TTSConfig): Promise<TTSResult> {

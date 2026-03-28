@@ -20,7 +20,7 @@ export interface Campaign {
 
 export type TelephonyProvider = 'telnyx' | 'twilio'
 export type STTProvider = 'deepgram' | 'google'
-export type TTSProvider = 'elevenlabs' | 'deepgram' | 'google'
+export type TTSProvider = 'elevenlabs' | 'deepgram' | 'google' | 'cartesia'
 export type LLMProvider = 'anthropic' | 'openai'
 
 export interface Agent {
