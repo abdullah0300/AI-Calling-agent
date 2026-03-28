@@ -1,9 +1,29 @@
-import { createSTTStream } from '../providers/stt'
-import { streamTextToSpeech } from '../providers/tts'
-import { streamAgentResponse } from '../providers/llm'
+// ─── Call Session Pipeline ────────────────────────────────────────────────────
+// Orchestrates the full lifecycle of a single outbound call:
+//   Audio in → Denoise → STT → Turn detection → LLM → TTS → Audio out
+//
+// ARCHITECTURE — layered, each component has one job:
+//   1. Audio ingestion:  mulaw → linear16 PCM (once, at entry — never re-encoded)
+//   2. Noise suppression: PCM in / PCM out (no codec inside)
+//   3. STT (Deepgram Flux): transcript + StartOfTurn + EagerEndOfTurn + EndOfTurn
+//   4. Barge-in manager:  generation counter + single signal (STT only, no energy VAD)
+//   5. LLM stream:        AbortSignal — actually cancels on barge-in
+//   6. TTS stream:        generation check on every chunk — stale audio dropped
+//
+// THE KEY MECHANISM — generation counter:
+//   Every response cycle starts with `myGeneration = data.generation`.
+//   fireBargeIn() does `data.generation++`.
+//   Every async callback (onSentence, onChunk, marks) checks:
+//     if (current.generation !== myGeneration) return  // stale — drop silently
+//   This single pattern eliminates the race condition where an old LLM stream
+//   speaks sentences into the new turn after bargedIn was reset to false.
+
+import { createSTTStream }          from '../providers/stt'
+import { streamTextToSpeech }       from '../providers/tts'
+import { streamAgentResponse }      from '../providers/llm'
 import { detectScenario, buildSystemPrompt } from './scenarios'
-import { supabase } from '../db/client'
-import { loadSettings } from '../db/settings'
+import { supabase }                 from '../db/client'
+import { loadSettings }             from '../db/settings'
 import {
   initNoiseSuppression,
   createNoiseSuppressionState,
@@ -11,243 +31,239 @@ import {
   denoiseAudioChunk,
 } from '../providers/noise-suppression'
 import { startRecording, stopRecording } from '../providers/recording'
-import { logger } from '../utils/logger'
-import type { PlatformSettings } from '../db/settings'
+import { logger }                   from '../utils/logger'
+import type { PlatformSettings }    from '../db/settings'
 import type { CallSession, TranscriptEntry } from '@voiceflow/shared'
-import type WebSocket from 'ws'
+import WebSocket                    from 'ws'
 
-// Initialise RNNoise WASM once at module load — all sessions share the same module.
-// Sessions each get their own stateful RNNoise handle (createNoiseSuppressionState).
+// Await WASM load at module startup — first call won't run without denoising
+// (previously this was fire-and-forget which meant early calls had no denoising)
 initNoiseSuppression()
 
-// Deepgram Nova-3 streaming rate (2026): $0.0077 / min
-// (source: deepgram.com/pricing)
-const DEEPGRAM_STT_PER_BYTE = 0.0077 / 60 / 8000  // $0.0077/min ÷ 60s ÷ 8000 bytes/s (mulaw 8kHz)
+// STT cost: Deepgram Nova-3 / Flux rate 2026 — $0.0077/min at mulaw 8kHz
+const DEEPGRAM_STT_PER_BYTE = 0.0077 / 60 / 8000
 
-// ─── Local VAD constants for fast barge-in ───────────────────────────────────
-// After RNNoise denoising, audio reaching this VAD is already cleaned.
-// Threshold raised from 600 → 2000: on a denoised signal, real speech from the
-// prospect sits at 1500-5000 RMS while residual noise stays below 1000.
-// Min duration raised from 150ms → 500ms: matches LiveKit/BytePlus industry
-// standard — filters coughs, door slams, and short background bursts that a
-// denoiser can't fully eliminate.
-const BARGE_IN_ENERGY_THRESHOLD = 2000  // RMS of decoded linear16 — above this = likely speech
-const BARGE_IN_MIN_SPEECH_MS    = 500   // ms of sustained speech before triggering barge-in
+// ─── mulaw → linear16 decoder ────────────────────────────────────────────────
+// Converts Telnyx inbound audio (mulaw 8kHz) to linear16 PCM (Int16LE).
+// Called ONCE per chunk in handleAudioChunk — all downstream modules (noise
+// suppression, STT) receive PCM and never see mulaw again.
+function mulawToLinear16(mulaw: Buffer): Buffer {
+  const out = Buffer.alloc(mulaw.length * 2)
+  for (let i = 0; i < mulaw.length; i++) {
+    let b         = (~mulaw[i]) & 0xFF
+    const sign    = b & 0x80
+    const exp     = (b >> 4) & 0x07
+    const mant    = b & 0x0F
+    let s         = ((mant << 3) | 0x84) << exp
+    s            -= 0x84
+    if (sign) s   = -s
+    s             = Math.max(-32768, Math.min(32767, s))
+    out.writeInt16LE(s, i * 2)
+  }
+  return out
+}
 
 // ─── Backchannel detection ────────────────────────────────────────────────────
-// Backchannel utterances ("yeah", "uh-huh", "okay") are acknowledgment sounds
-// the prospect makes WHILE the agent is speaking. They are NOT interruptions and
-// should NOT trigger a full LLM response. This list covers the most common ones.
+// Short acknowledgment sounds the prospect makes while the agent speaks.
+// These are NOT interruptions — they must not trigger a full LLM response.
 const BACKCHANNEL_WORDS = new Set([
   'yeah', 'yes', 'yep', 'yup', 'ya',
   'uh-huh', 'mm-hmm', 'mhm', 'mm', 'hmm', 'hm',
-  'ok', 'okay',
-  'alright', 'alright.', 'right',
-  'sure', 'got it',
-  'i see', 'oh', 'ah',
-  'uh', 'um',
+  'ok', 'okay', 'alright', 'right',
+  'sure', 'got it', 'i see',
+  'oh', 'ah', 'uh', 'um',
   'cool', 'great', 'fine',
 ])
 
-// Returns true when every word in text is a backchannel acknowledgment.
-// Used to ignore filler responses that don't warrant an agent reply.
 function isBackchannelOnly(text: string): boolean {
   const words = text.toLowerCase().replace(/[.,!?]/g, '').trim().split(/\s+/).filter(Boolean)
-  if (words.length === 0 || words.length > 4) return false  // >4 words = real speech
+  if (words.length === 0 || words.length > 4) return false
   return words.every(w => BACKCHANNEL_WORDS.has(w))
 }
 
-// Decodes a mulaw 8kHz buffer and returns its RMS energy (linear16 scale).
-// Used by local VAD to detect prospect speech during agent audio playback.
-function mulawRms(buf: Buffer): number {
-  let sumSq = 0
-  for (let i = 0; i < buf.length; i++) {
-    let b = (~buf[i]) & 0xFF
-    const sign = b & 0x80
-    const exp  = (b >> 4) & 0x07
-    const mant = b & 0x0F
-    let s = ((mant << 3) | 0x84) << exp
-    s -= 0x84
-    if (sign) s = -s
-    sumSq += s * s
-  }
-  return Math.sqrt(sumSq / buf.length)
-}
-
+// ─── Session state ────────────────────────────────────────────────────────────
 interface ActiveSession {
-  session: CallSession
-  ws: WebSocket | null
-  sttStream: ReturnType<typeof createSTTStream> | null
+  session:             CallSession
+  ws:                  WebSocket | null
+  sttStream:           ReturnType<typeof createSTTStream> | null
   conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }>
-  isProcessing: boolean
-  isStarted: boolean
-  maxDurationTimer: NodeJS.Timeout | null
-  // Cost accumulators (USD)
-  costLlm: number
-  costTts: number
-  sttAudioBytes: number  // raw bytes sent to Deepgram — converted to cost at endSession
-  // Latency measurements: ms from STT final transcript → first audio chunk sent, per turn
-  latencyMeasurements: number[]
-  // Platform settings loaded from DB at session start
-  // API keys + global provider defaults, merged with per-agent overrides
-  platformSettings: PlatformSettings | null
-  // Barge-in state — set when the agent is currently playing audio to the prospect
-  isSpeaking: boolean
-  currentTtsAbort: AbortController | null
-  // Set to true when barge-in fires mid-LLM-stream — onSentence skips remaining sentences
-  bargedIn: boolean
-  // Telnyx stream_id from the WS 'start' event — required to send the 'clear' command
-  telnyxStreamId: string | null
-  // SET of mark IDs sent to Telnyx that haven't been echoed back yet.
-  // Each sentence adds its markId BEFORE the TTS fetch starts — this prevents the race condition
-  // where sentence N's mark returns from Telnyx while sentence N+1's TTS is still fetching,
-  // which used to flip isSpeaking=false even though more audio was about to play.
-  // isSpeaking stays true as long as pendingMarkIds.size > 0.
-  pendingMarkIds: Set<string>
-  // Accumulated ms of audio above speech-energy threshold — for local VAD barge-in detection.
-  // Reset to 0 when energy drops below threshold or barge-in fires.
-  vadSpeechMs: number
-  // RNNoise denoising state handle for this session — one stateful handle per call so
-  // the recurrent network can track noise profile across frames.
-  denoisingSessionId: string
-  // False interruption recovery (Item 3):
-  // Stores the text the agent was speaking when barge-in fired so we can resume
-  // if no real transcript arrives within the recovery window.
-  currentSpeakingText: string | null
-  // Timer ID for the false barge-in recovery window (2.5s).
-  // Cancelled immediately when a real transcript arrives in handleProspectSpeech.
-  // Fires speakToProspect with currentSpeakingText if the window expires without a transcript.
+  platformSettings:    PlatformSettings | null
+
+  // ── Generation counter — THE KEY MECHANISM ───────────────────────────────
+  // Starts at 0. Incremented by fireBargeIn() on every interruption.
+  // Every async operation captures `myGeneration = data.generation` at the
+  // moment it starts, then checks `current.generation !== myGeneration` before
+  // acting. A mismatch means a barge-in happened — silently drop and exit.
+  // This prevents old LLM streams / TTS chunks from leaking into the new turn.
+  generation: number
+
+  // ── Active operation handles ─────────────────────────────────────────────
+  // Both abort controllers are called together in fireBargeIn.
+  // Keeping them separate lets each provider (LLM, TTS) clean up independently.
+  llmAbortController: AbortController | null
+  ttsAbortController: AbortController | null
+
+  // ── Playback state ───────────────────────────────────────────────────────
+  isSpeaking:        boolean           // true while Telnyx is playing agent audio
+  pendingMarkIds:    Set<string>       // marks sent but not yet echoed by Telnyx
+  telnyxStreamId:    string | null     // needed for the 'clear' command on barge-in
+  currentSpeakingText: string | null   // text agent was saying — for false-barge-in recovery
+
+  // ── False barge-in recovery ──────────────────────────────────────────────
+  // If no transcript arrives within 2s after barge-in, it was noise.
+  // Timer fires → agent resumes from currentSpeakingText (same generation).
   falseBargeInTimer: NodeJS.Timeout | null
-  // Barge-in event logging (Item 6):
-  // DB row ID of the most recent barge-in event that hasn't been resolved yet.
-  // Set asynchronously after fireBargeIn inserts the row; cleared when the
-  // outcome is determined (real or false) and the row is updated.
-  pendingBargeInEventId: string | null
+
+  // ── Turn state ───────────────────────────────────────────────────────────
+  isProcessing:    boolean              // true while LLM+TTS pipeline is running
+  isStarted:       boolean              // guard against double-start
+  maxDurationTimer: NodeJS.Timeout | null
+
+  // ── Speculative generation (EagerEndOfTurn) ──────────────────────────────
+  // When Flux fires EagerEndOfTurn, we start the LLM speculatively.
+  // If TurnResumed fires (user kept talking), abort the speculation.
+  // If EndOfTurn confirms, we use the in-progress result.
+  speculativeAbort: AbortController | null
+  speculativeTranscript: string | null
+
+  // ── Cost & telemetry ─────────────────────────────────────────────────────
+  costLlm:              number
+  costTts:              number
+  sttAudioBytes:        number       // mulaw bytes sent to STT — for cost calculation
+  latencyMeasurements:  number[]     // ms from STT final → first audio chunk per turn
+
+  // ── Noise suppression ────────────────────────────────────────────────────
+  denoisingSessionId: string         // per-call RNNoise state handle
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
 
+// ─── Session registration ─────────────────────────────────────────────────────
+// Called by the dialer (engine.ts) before placing the Telnyx call.
+// Creates the RNNoise state so it is ready before the first audio chunk arrives.
 export function registerSession(callControlId: string, session: CallSession) {
-  // Create a unique ID for this session's RNNoise state.
-  // The state must exist before the first audio chunk arrives.
   const denoisingSessionId = `ns_${callControlId}`
   createNoiseSuppressionState(denoisingSessionId)
 
   activeSessions.set(callControlId, {
-    session, ws: null, sttStream: null,
-    conversationHistory: [], isProcessing: false, isStarted: false, maxDurationTimer: null,
-    costLlm: 0, costTts: 0, sttAudioBytes: 0, latencyMeasurements: [], platformSettings: null,
-    isSpeaking: false, currentTtsAbort: null, bargedIn: false, telnyxStreamId: null,
-    pendingMarkIds: new Set<string>(), vadSpeechMs: 0, denoisingSessionId,
-    currentSpeakingText: null, falseBargeInTimer: null, pendingBargeInEventId: null,
+    session,
+    ws:                   null,
+    sttStream:            null,
+    conversationHistory:  [],
+    platformSettings:     null,
+    generation:           0,           // starts at 0 — first turn is generation 0
+    llmAbortController:   null,
+    ttsAbortController:   null,
+    isSpeaking:           false,
+    pendingMarkIds:       new Set(),
+    telnyxStreamId:       null,
+    currentSpeakingText:  null,
+    falseBargeInTimer:    null,
+    isProcessing:         false,
+    isStarted:            false,
+    maxDurationTimer:     null,
+    speculativeAbort:     null,
+    speculativeTranscript: null,
+    costLlm:              0,
+    costTts:              0,
+    sttAudioBytes:        0,
+    latencyMeasurements:  [],
+    denoisingSessionId,
   })
   console.log(`[Pipeline] Session registered: ${callControlId}`)
 }
 
 export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?: string) {
-  const data = activeSessions.get(callControlId)
-  if (data) {
-    data.ws = ws
-    data.telnyxStreamId = streamId || null
+  const d = activeSessions.get(callControlId)
+  if (d) {
+    d.ws             = ws
+    d.telnyxStreamId = streamId || null
     console.log(`[Pipeline] WebSocket attached: ${callControlId} (stream_id: ${streamId ?? 'n/a'})`)
   }
 }
 
-// Central barge-in handler — called by both the STT onSpeechStarted callback AND the local VAD.
-// Immediately stops TTS, clears all pending marks, and clears Telnyx's audio buffer.
-// Starts a 2.5s false-barge-in recovery timer: if no real transcript arrives within
-// that window (meaning the barge-in was triggered by noise, not actual speech),
-// the agent resumes speaking from where it left off.
-// Every firing inserts a row into barge_in_events; the outcome is resolved later.
-function fireBargeIn(callControlId: string, source: 'vad' | 'stt'): void {
+// ─── Barge-in handler ─────────────────────────────────────────────────────────
+// Single entry point — called ONLY by STT's onSpeechStarted (Flux StartOfTurn
+// after the 250ms backchannel window). Energy VAD removed entirely.
+//
+// The generation counter is the core action here:
+//   d.generation++  →  every in-flight LLM callback and TTS chunk checks this
+//                       number and drops silently if it no longer matches.
+// This replaces the old `bargedIn` boolean flag which had a race condition:
+// `bargedIn` was reset to false at the start of the next turn, allowing old
+// LLM streams to speak again after the reset.
+function fireBargeIn(callControlId: string): void {
   const d = activeSessions.get(callControlId)
   if (!d || !d.isSpeaking) return
-  console.log(`[Pipeline] Barge-in detected (${source}) — aborting TTS ${callControlId}`)
 
-  // Snapshot what the agent was saying so we can recover if it was a false barge-in
+  const prevGen = d.generation
+  d.generation++   // ← THE KEY LINE — invalidates all in-flight operations
+  console.log(`[Pipeline] Barge-in — generation ${prevGen} → ${d.generation} | ${callControlId}`)
+
   const textToRecover = d.currentSpeakingText
 
-  d.bargedIn = true
-  d.currentTtsAbort?.abort()
-  d.currentTtsAbort = null
-  d.isSpeaking = false
-  d.pendingMarkIds.clear()
-  d.vadSpeechMs = 0
-  d.isProcessing = false  // allow new speech turn to start immediately
-  d.pendingBargeInEventId = null  // reset — will be set once insert resolves
+  // Cancel in-flight LLM stream (stops token generation immediately)
+  d.llmAbortController?.abort()
+  d.llmAbortController = null
 
-  if (d.ws && d.ws.readyState === d.ws.OPEN) {
-    d.ws.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
-    console.log(`[Pipeline] Telnyx audio buffer cleared (barge-in)`)
+  // Cancel in-flight TTS stream (stops audio fetch immediately)
+  d.ttsAbortController?.abort()
+  d.ttsAbortController = null
+
+  // Cancel any speculative generation from EagerEndOfTurn
+  d.speculativeAbort?.abort()
+  d.speculativeAbort     = null
+  d.speculativeTranscript = null
+
+  // Reset playback and turn state
+  d.isSpeaking   = false
+  d.pendingMarkIds.clear()
+  d.isProcessing = false
+
+  // Clear Telnyx audio buffer — stops any buffered audio from playing
+  if (d.ws?.readyState === WebSocket.OPEN) {
+    d.ws!.send(JSON.stringify({ event: 'clear', stream_id: d.telnyxStreamId }))
+    console.log('[Pipeline] Telnyx buffer cleared')
   }
 
-  // Log the barge-in event to DB — fire-and-forget, non-blocking.
-  // The outcome starts as 'pending' and is resolved to 'real' or 'false' below.
-  void Promise.resolve(
-    supabase.from('barge_in_events').insert({
-      call_id:    d.session.callId,
-      fired_at:   new Date().toISOString(),
-      agent_text: textToRecover,
-      trigger:    source,
-      outcome:    'pending',
-    }).select('id').single()
-  ).then(({ data, error }) => {
-    if (error) { console.error('[BargeIn] DB log insert failed:', error.message); return }
-    const current = activeSessions.get(callControlId)
-    if (current && data) current.pendingBargeInEventId = data.id
-  }, err => console.error('[BargeIn] DB log insert error:', err))
-
-  // False barge-in recovery: if no transcript arrives within 2.5s, the interruption
-  // was caused by noise (not real speech) — resume agent audio from the saved text.
+  // ── False barge-in recovery ──────────────────────────────────────────────
+  // If no transcript arrives within 2s, the interruption was noise (not speech).
+  // Resume agent audio — but only if we are still in the same generation
+  // (i.e., no further barge-in happened during the recovery window).
   if (textToRecover) {
     if (d.falseBargeInTimer) clearTimeout(d.falseBargeInTimer)
+    const recoveryGeneration = d.generation  // capture — must still match when timer fires
     d.falseBargeInTimer = setTimeout(async () => {
       d.falseBargeInTimer = null
       const current = activeSessions.get(callControlId)
-      // Only recover if the session still exists, nothing new is processing or speaking,
-      // and the agent hasn't already started a new turn via a real transcript.
-      if (!current || current.isProcessing || current.isSpeaking) return
-      console.log(`[Pipeline] False barge-in recovery — no transcript in 2.5s, resuming: "${textToRecover}"`)
-      current.bargedIn = false
-
-      // Resolve the barge-in event as 'false' — noise triggered it, not real speech
-      if (current.pendingBargeInEventId) {
-        const eventId = current.pendingBargeInEventId
-        current.pendingBargeInEventId = null
-        void Promise.resolve(
-          supabase.from('barge_in_events').update({ outcome: 'false', resolved_at: new Date().toISOString() }).eq('id', eventId)
-        ).then(null, err => console.error('[BargeIn] DB false-outcome update failed:', err))
-      }
-
-      await speakToProspect(callControlId, textToRecover)
-    }, 2500)
+      if (!current)                                       return  // session ended
+      if (current.generation !== recoveryGeneration)     return  // new barge-in happened
+      if (current.isProcessing || current.isSpeaking)   return  // new turn already running
+      console.log(`[Pipeline] False barge-in recovery — resuming: "${textToRecover}"`)
+      await speakText(callControlId, textToRecover, recoveryGeneration)
+    }, 2000)
   }
 }
 
+// ─── Session start ────────────────────────────────────────────────────────────
+// Called from index.ts when Telnyx WebSocket fires the 'start' event.
+// WebSocket is already attached at this point — greeting audio can be sent immediately.
 export async function startSession(callControlId: string) {
   const data = activeSessions.get(callControlId)
-  if (!data) return console.error(`[Pipeline] No session: ${callControlId}`)
-  // Guard against double-start (webhook + WS event could both trigger this)
-  if (data.isStarted) return console.warn(`[Pipeline] Session already started: ${callControlId}`)
+  if (!data)          return console.error(`[Pipeline] No session for ${callControlId}`)
+  if (data.isStarted) return console.warn(`[Pipeline] Already started: ${callControlId}`)
   data.isStarted = true
 
   const { session } = data
 
-  // Load API keys + global settings from DB
-  // Agent's active_llm/stt/tts override the global defaults for provider routing
+  // Load API keys and provider settings from DB
   const platformSettings = await loadSettings()
-  data.platformSettings = platformSettings
+  data.platformSettings  = platformSettings
 
-  // Start call recording if enabled — fire-and-forget, non-blocking.
-  // The recording URL is delivered later via the call.recording.saved webhook.
+  // Start recording (fire-and-forget — URL arrives via call.recording.saved webhook)
   if (platformSettings.recording_enabled && platformSettings.telnyx_api_key) {
     startRecording(callControlId, platformSettings.telnyx_api_key)
-      .then(() => {
-        console.log(`[Recording] Started dual-channel recording for ${callControlId}`)
-        return supabase.from('calls')
-          .update({ recording_status: 'in_progress' })
-          .eq('id', session.callId)
-      })
+      .then(() => supabase.from('calls').update({ recording_status: 'in_progress' }).eq('id', session.callId))
       .catch(err => logger.error('recording', `Failed to start recording: ${String(err)}`, { callId: session.callId }))
   }
 
@@ -259,420 +275,528 @@ export async function startSession(callControlId: string) {
     .update({ status: 'calling' })
     .eq('id', session.leadId)
 
-  // Safety timer — force end after max duration to prevent cost overruns
+  // Safety timer — force end after max duration to prevent runaway cost
   data.maxDurationTimer = setTimeout(
     () => endSession(callControlId, 'timeout'),
-    session.maxDuration * 1000
+    session.maxDuration * 1000,
   )
 
-  // Provider selection: agent field wins (per-agent override), falls back to global setting
+  // Provider selection: agent-level setting overrides global platform setting
   const sttProvider = (session.agent.active_stt || platformSettings.active_stt) as 'deepgram' | 'google'
-
-  // STT model: agent-level override wins, falls back to global setting
-  const sttModel = session.agent.active_stt_model || platformSettings.active_stt_model
+  const sttModel    = session.agent.active_stt_model || platformSettings.active_stt_model
 
   data.sttStream = createSTTStream({
     provider: sttProvider,
-    apiKey: platformSettings.deepgram_api_key,
-    model: sttModel,
+    apiKey:   platformSettings.deepgram_api_key,
+    model:    sttModel,
+
+    // Final transcript — commit LLM response
     onTranscript: async (text, isFinal) => {
-      if (isFinal && text.length > 3) await handleProspectSpeech(callControlId, text)
+      if (isFinal && text.length > 3) {
+        // Cancel any pending false barge-in recovery — real speech confirmed
+        if (data.falseBargeInTimer) {
+          clearTimeout(data.falseBargeInTimer)
+          data.falseBargeInTimer = null
+        }
+        await handleProspectSpeech(callControlId, text)
+      }
     },
+
+    // Barge-in signal — single source of truth (STT only, no parallel energy VAD)
+    onSpeechStarted: () => fireBargeIn(callControlId),
+
+    // EagerEndOfTurn — start LLM speculatively to reduce response latency
+    onEagerEndOfTurn: (transcript) => {
+      const d = activeSessions.get(callControlId)
+      if (!d || d.isProcessing || d.isSpeaking) return
+      // Only speculate if no current speculation is already running
+      if (d.speculativeAbort) return
+      console.log(`[Pipeline] EagerEndOfTurn — starting speculative LLM for: "${transcript}"`)
+      d.speculativeTranscript = transcript
+      d.speculativeAbort      = new AbortController()
+      // Fire-and-forget speculation — handleProspectSpeech will use it if EndOfTurn confirms
+      runSpeculativeLLM(callControlId, transcript, d.speculativeAbort.signal, d.generation)
+        .catch(err => { if (err?.name !== 'AbortError') console.error('[Pipeline] Speculative LLM error:', err) })
+    },
+
+    // TurnResumed — user kept talking, cancel the speculative LLM
+    onTurnResumed: () => {
+      const d = activeSessions.get(callControlId)
+      if (!d) return
+      console.log('[Pipeline] TurnResumed — cancelling speculative LLM')
+      d.speculativeAbort?.abort()
+      d.speculativeAbort      = null
+      d.speculativeTranscript = null
+    },
+
     onError: (error) => logger.error('stt', `STT error: ${error.message}`, { callId: data.session.callId }),
-    // STT-based barge-in: Deepgram fires SpeechStarted (Nova-2) or StartOfTurn (Flux)
-    // when it detects the prospect starting to speak. We also run a parallel local VAD
-    // in handleAudioChunk for faster (~80ms) detection independent of the STT model.
-    onSpeechStarted: () => fireBargeIn(callControlId, 'stt'),
   })
 
-  await speakToProspect(callControlId, session.agent.greeting_message)
+  // Brief 300ms pause before greeting — gives the prospect's initial "Hello?"
+  // time to finish before the agent speaks. Without this, the greeting overlaps
+  // the prospect's opening utterance and triggers an immediate false barge-in.
+  await new Promise(resolve => setTimeout(resolve, 300))
+
+  await speakText(callControlId, session.agent.greeting_message, data.generation)
   console.log(`[Pipeline] Session started: ${callControlId}`)
 }
 
+// ─── Audio ingestion ──────────────────────────────────────────────────────────
+// Entry point for all inbound audio from Telnyx (mulaw 8kHz).
+// FORMAT CONVERSION HAPPENS HERE — once, at the boundary.
+// All downstream modules receive linear16 PCM and never touch mulaw.
 export async function handleAudioChunk(callControlId: string, audioBuffer: Buffer) {
   const data = activeSessions.get(callControlId)
   if (!data?.sttStream) return
 
-  // ── Noise suppression (RNNoise) ───────────────────────────────────────────
-  // Clean the audio BEFORE it reaches VAD or STT. This is the core fix for
-  // false barge-ins triggered by background noise (HVAC, traffic, TV audio).
-  // denoiseAudioChunk falls back to the original buffer if WASM isn't loaded.
-  const cleanBuffer = denoiseAudioChunk(data.denoisingSessionId, audioBuffer)
+  // 1. Convert mulaw → linear16 PCM (single conversion for the entire pipeline)
+  const pcm = mulawToLinear16(audioBuffer)
 
-  // Track bytes for STT cost calculation (mulaw 8kHz = 8000 bytes/sec)
-  data.sttAudioBytes += cleanBuffer.length
-  // Send denoised audio to STT — Deepgram sees cleaner signal, fewer false starts
-  data.sttStream.sendAudio(cleanBuffer)
+  // 2. Denoise: PCM in → PCM out (no mulaw re-encoding inside noise suppression)
+  const cleanPcm = denoiseAudioChunk(data.denoisingSessionId, pcm)
 
-  // ── Local VAD barge-in (runs on denoised audio while agent is speaking) ───
-  // Energy VAD now operates on cleaned audio — background noise has already been
-  // attenuated, so only real speech energy from the prospect crosses the threshold.
-  if (data.isSpeaking) {
-    const chunkMs = cleanBuffer.length / 8  // 8000 bytes/s → 8 bytes per ms
-    if (mulawRms(cleanBuffer) > BARGE_IN_ENERGY_THRESHOLD) {
-      data.vadSpeechMs += chunkMs
-      if (data.vadSpeechMs >= BARGE_IN_MIN_SPEECH_MS) {
-        data.vadSpeechMs = 0
-        fireBargeIn(callControlId, 'vad')
-      }
-    } else {
-      data.vadSpeechMs = 0
-    }
-  } else {
-    data.vadSpeechMs = 0
+  // 3. Track STT cost (based on original mulaw bytes = audio duration)
+  data.sttAudioBytes += audioBuffer.length
+
+  // 4. Send clean PCM to STT — Deepgram Flux and Nova both accept linear16
+  data.sttStream.sendAudio(cleanPcm)
+
+  // NOTE: Energy VAD removed entirely.
+  // Barge-in is now handled exclusively by STT's onSpeechStarted callback
+  // (Flux StartOfTurn after 250ms backchannel window).
+  // Reason: energy-based VAD has a 50% true positive rate at 5% false positive rate
+  // (Picovoice 2025 benchmark). Running it in parallel with STT caused double-
+  // triggering and unstable state. A single, well-filtered STT signal is more reliable.
+}
+
+// ─── Speculative LLM (EagerEndOfTurn) ────────────────────────────────────────
+// Starts generating the LLM response before EndOfTurn confirms the turn end.
+// Results are stored and reused by handleProspectSpeech if EndOfTurn arrives
+// with the same transcript. If TurnResumed fires first, the abort signal kills it.
+// This saves 150–250ms of LLM TTFT per turn.
+const speculativeResults = new Map<string, { text: string; sentences: string[] }>()
+
+async function runSpeculativeLLM(
+  callControlId: string,
+  transcript: string,
+  signal: AbortSignal,
+  generation: number,
+): Promise<void> {
+  const data = activeSessions.get(callControlId)
+  if (!data?.platformSettings) return
+
+  const { session, conversationHistory, platformSettings } = data
+  const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
+  const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : platformSettings.anthropic_api_key
+  const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
+
+  const sentences: string[] = []
+  let fullText = ''
+
+  await streamAgentResponse({
+    provider: llmProvider,
+    apiKey:   llmApiKey,
+    model:    llmModel,
+    systemPrompt: buildSystemPrompt(session.agent.system_prompt, {
+      businessName: session.lead.business_name,
+      industry:     session.lead.industry,
+      city:         session.lead.city || undefined,
+    }),
+    conversationHistory,
+    userMessage:  transcript,
+    abortSignal:  signal,
+    onSentence: async (sentence) => {
+      if (signal.aborted) return
+      sentences.push(sentence)
+      fullText += (fullText ? ' ' : '') + sentence
+    },
+  })
+
+  if (!signal.aborted) {
+    speculativeResults.set(`${callControlId}:${generation}`, { text: fullText, sentences })
+    console.log(`[Pipeline] Speculative LLM complete — ${sentences.length} sentences ready`)
   }
 }
 
+// ─── Prospect speech handler ──────────────────────────────────────────────────
+// Called by STT's onTranscript when EndOfTurn fires.
+// Captures the current generation at entry — every async operation below checks
+// this number before acting. If generation changed (barge-in happened), the
+// operation drops silently and the function exits cleanly.
 async function handleProspectSpeech(callControlId: string, transcript: string) {
   const data = activeSessions.get(callControlId)
   if (!data || data.isProcessing) return
 
-  // Backchannel filter: "yeah", "uh-huh", "okay" etc. while agent is speaking
-  // are acknowledgments, not real turns. Skip LLM entirely — no response needed.
   if (isBackchannelOnly(transcript)) {
     console.log(`[Pipeline] Backchannel ignored: "${transcript}"`)
     return
   }
 
-  // Real transcript arrived — cancel any pending false barge-in recovery timer.
-  // The barge-in was genuine; the agent should not resume its previous speech.
-  if (data.falseBargeInTimer) {
-    clearTimeout(data.falseBargeInTimer)
-    data.falseBargeInTimer = null
-  }
-
-  // Resolve the pending barge-in event as 'real' — a genuine transcript confirms
-  // the barge-in was not a false positive. Store the transcript for later analysis.
-  if (data.pendingBargeInEventId) {
-    const eventId = data.pendingBargeInEventId
-    data.pendingBargeInEventId = null
-    void Promise.resolve(
-      supabase.from('barge_in_events').update({ outcome: 'real', transcript, resolved_at: new Date().toISOString() }).eq('id', eventId)
-    ).then(null, err => console.error('[BargeIn] DB real-outcome update failed:', err))
-  }
-
-  data.isProcessing = true
-  data.bargedIn = false  // reset — new turn starting
-  const turnStart = Date.now()
+  data.isProcessing  = true
+  const myGeneration = data.generation   // ← captured here, checked everywhere below
+  const turnStart    = Date.now()
   let firstChunkSent = false
 
-  // Called on the first audio chunk of each turn — measures STT final → first audio out.
   const onFirstChunk = () => {
     if (firstChunkSent) return
     firstChunkSent = true
     const latency = Date.now() - turnStart
     data.latencyMeasurements.push(latency)
-    console.log(`[Latency] Turn response: ${latency}ms`)
+    console.log(`[Latency] ${latency}ms (gen ${myGeneration})`)
   }
 
   try {
     const { session, conversationHistory, platformSettings } = data
-
     if (!platformSettings) return
 
-    session.transcript.push({
-      role: 'prospect', text: transcript, timestamp: new Date().toISOString()
-    })
+    session.transcript.push({ role: 'prospect', text: transcript, timestamp: new Date().toISOString() })
+    console.log(`[Pipeline] Prospect (gen ${myGeneration}): "${transcript}"`)
 
-    console.log(`[Pipeline] Prospect: "${transcript}"`)
-
-    const scenario = detectScenario(transcript)
-    let responseText = ''
+    const scenario    = detectScenario(transcript)
+    let responseText  = ''
 
     switch (scenario) {
+
       case 'voicemail':
         await endSession(callControlId, 'voicemail')
         return
 
       case 'not_interested':
         responseText = session.agent.not_interested_message
-        await speakToProspect(callControlId, responseText, onFirstChunk)
+        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
         setTimeout(() => endSession(callControlId, 'not_interested'), 4000)
         return
 
       case 'interested':
         responseText = session.agent.interest_detected_message
-        await speakToProspect(callControlId, responseText, onFirstChunk)
+        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
         setTimeout(() => endSession(callControlId, 'interested'), 6000)
         return
 
       case 'wrong_person':
         responseText = session.agent.wrong_person_message
-        await speakToProspect(callControlId, responseText, onFirstChunk)
+        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
         break
 
       case 'callback_request':
         responseText = session.agent.callback_message
-        await speakToProspect(callControlId, responseText, onFirstChunk)
+        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
         break
 
-      default:
+      default: {
+        const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
+        const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
+        const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : platformSettings.anthropic_api_key
+
+        // Check if a speculative result is ready from EagerEndOfTurn
+        const speculativeKey    = `${callControlId}:${myGeneration}`
+        const speculativeResult = speculativeResults.get(speculativeKey)
+        speculativeResults.delete(speculativeKey)
+
+        // Clean up any still-running speculative LLM for this turn
+        if (data.speculativeAbort && data.speculativeTranscript === transcript) {
+          // Let it finish — we'll use the result
+        } else if (data.speculativeAbort) {
+          // Different transcript from speculation — abort it
+          data.speculativeAbort.abort()
+          data.speculativeAbort      = null
+          data.speculativeTranscript = null
+        }
+
         try {
-          // Provider selection: agent field wins, falls back to global setting
-          const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
-          const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
-          const llmApiKey   = llmProvider === 'openai'
-            ? platformSettings.openai_api_key
-            : platformSettings.anthropic_api_key
-          const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'google'
-          const ttsApiKey   = ttsProvider === 'elevenlabs'
-            ? platformSettings.elevenlabs_api_key
-            : platformSettings.deepgram_api_key
+          const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram'
+          const ttsApiKey   = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_api_key : platformSettings.deepgram_api_key
           const ttsVoiceId  = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined
 
-          // Stream LLM tokens → fire TTS on each sentence → send audio chunks immediately.
-          // This eliminates the full-response wait and starts audio ~150ms after first sentence.
-          const result = await streamAgentResponse({
-            provider: llmProvider,
-            apiKey: llmApiKey,
-            model: llmModel,
-            systemPrompt: buildSystemPrompt(session.agent.system_prompt, {
-              businessName: session.lead.business_name,
-              industry: session.lead.industry,
-              city: session.lead.city || undefined,
-            }),
-            conversationHistory,
-            userMessage: transcript,
-            onSentence: async (sentence) => {
+          if (speculativeResult) {
+            // ── Fast path: speculative result ready — speak sentences immediately ──
+            console.log(`[Pipeline] Using speculative result (${speculativeResult.sentences.length} sentences)`)
+            for (const sentence of speculativeResult.sentences) {
               const current = activeSessions.get(callControlId)
-              if (!current?.ws || current.ws.readyState !== current.ws.OPEN) return
-              if (current.bargedIn) return  // prospect interrupted — skip remaining sentences
+              if (!current || current.generation !== myGeneration) break
+              await speakText(callControlId, sentence, myGeneration, onFirstChunk)
+            }
+            responseText = speculativeResult.text
 
-              // Track per-sentence so false barge-in recovery re-speaks the interrupted sentence.
-              current.currentSpeakingText = sentence
+            // Clean up speculative state
+            data.speculativeAbort      = null
+            data.speculativeTranscript = null
 
-              const sentenceAbort = new AbortController()
-              const sentenceMarkId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-              // Add markId to the pending set BEFORE the TTS fetch starts.
-              // This prevents the race condition: sentence N's mark can return from Telnyx
-              // while sentence N+1's TTS is still fetching — with the Set, N+1 is already
-              // registered, so isSpeaking stays true until N+1's mark also returns.
-              current.pendingMarkIds.add(sentenceMarkId)
-              current.currentTtsAbort = sentenceAbort
-              current.isSpeaking = true
-              try {
-                const sentenceCost = await streamTextToSpeech({
-                  provider: ttsProvider,
-                  apiKey: ttsApiKey,
-                  voiceId: ttsVoiceId,
-                  text: sentence,
-                  abortSignal: sentenceAbort.signal,
-                  // Fallback: if ElevenLabs returns 402/429/5xx, automatically
-                  // serve this sentence (and the rest of the call) via Deepgram Aura.
-                  fallbackApiKey: ttsProvider === 'elevenlabs' ? platformSettings.deepgram_api_key : undefined,
-                  onChunk: (base64Audio) => {
-                    onFirstChunk()
-                    const c = activeSessions.get(callControlId)
-                    if (c?.ws && c.ws.readyState === c.ws.OPEN) {
-                      c.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
-                    }
-                  },
-                })
-                data.costTts += sentenceCost
-                // Send mark to Telnyx — it will echo back when this sentence finishes playing
-                const c = activeSessions.get(callControlId)
-                if (c?.ws && c.ws.readyState === c.ws.OPEN) {
-                  c.ws.send(JSON.stringify({ event: 'mark', stream_id: c.telnyxStreamId, mark: { name: sentenceMarkId } }))
-                }
-              } catch (ttsErr) {
-                if (!(ttsErr instanceof Error && ttsErr.name === 'AbortError')) {
-                  logger.error('tts', `TTS stream error: ${ttsErr}`, { callId: data?.session?.callId })
-                }
-                // On abort (barge-in already cleared the set) or error — remove this mark
-                if (current.currentTtsAbort === sentenceAbort) {
-                  current.pendingMarkIds.delete(sentenceMarkId)
-                  if (current.pendingMarkIds.size === 0) current.isSpeaking = false
-                }
-              } finally {
-                if (current.currentTtsAbort === sentenceAbort) {
-                  current.currentTtsAbort = null
-                  // isSpeaking cleared by onTelnyxMark when all marks return
-                }
-              }
-            },
-          })
-          responseText = result.text
-          data.costLlm += result.costUsd
-          console.log(`[Cost] LLM +$${result.costUsd.toFixed(6)} (total LLM: $${data.costLlm.toFixed(6)})`)
+          } else {
+            // ── Normal path: stream LLM tokens → TTS sentence by sentence ─────────
+            const llmAbort        = new AbortController()
+            data.llmAbortController = llmAbort
 
-          // Transcript logged here — TTS was already sent sentence by sentence above
-          session.transcript.push({ role: 'agent', text: responseText, timestamp: new Date().toISOString() })
-          console.log(`[Pipeline] Agent: "${responseText}"`)
-        } catch (llmError) {
-          logger.error('pipeline', `LLM error: ${llmError}`, { callId: session.callId })
-          responseText = "Could you repeat that? I did not quite catch it."
-          await speakToProspect(callControlId, responseText)
+            const result = await streamAgentResponse({
+              provider:    llmProvider,
+              apiKey:      llmApiKey,
+              model:       llmModel,
+              systemPrompt: buildSystemPrompt(session.agent.system_prompt, {
+                businessName: session.lead.business_name,
+                industry:     session.lead.industry,
+                city:         session.lead.city || undefined,
+              }),
+              conversationHistory,
+              userMessage: transcript,
+              abortSignal: llmAbort.signal,
+
+              onSentence: async (sentence) => {
+                // Generation check — barge-in increments generation, making
+                // myGeneration stale. Old sentences are silently dropped here.
+                const current = activeSessions.get(callControlId)
+                if (!current || current.generation !== myGeneration) return
+                await speakText(callControlId, sentence, myGeneration, onFirstChunk)
+              },
+            })
+
+            if (data.generation === myGeneration) {
+              responseText    = result.text
+              data.costLlm   += result.costUsd
+              data.llmAbortController = null
+            }
+          }
+
+        } catch (llmErr: any) {
+          if (llmErr?.name === 'AbortError') return  // barge-in — clean exit
+          logger.error('pipeline', `LLM error: ${llmErr}`, { callId: session.callId })
+          if (data.generation === myGeneration) {
+            responseText = "Could you repeat that? I did not quite catch it."
+            await speakText(callControlId, responseText, myGeneration)
+          }
         }
         break
+      }
     }
 
-    conversationHistory.push({ role: 'user', content: transcript })
-    conversationHistory.push({ role: 'assistant', content: responseText })
-    // Keep only last 20 messages to limit token usage
-    if (conversationHistory.length > 20) {
-      data.conversationHistory = conversationHistory.slice(-20)
+    // Update conversation history — only if still the current generation
+    if (data.generation === myGeneration && responseText) {
+      conversationHistory.push({ role: 'user',      content: transcript    })
+      conversationHistory.push({ role: 'assistant', content: responseText  })
+      if (conversationHistory.length > 20) {
+        data.conversationHistory = conversationHistory.slice(-20)
+      }
+      session.transcript.push({ role: 'agent', text: responseText, timestamp: new Date().toISOString() })
+      console.log(`[Pipeline] Agent (gen ${myGeneration}): "${responseText}"`)
     }
 
-  } catch (error) {
-    logger.error('pipeline', `Speech handling error: ${error}`, { callId: activeSessions.get(callControlId)?.session?.callId })
+  } catch (err) {
+    logger.error('pipeline', `Speech handling error: ${err}`, { callId: data.session?.callId })
   } finally {
-    data.isProcessing = false
+    // Only release isProcessing if we're still the current generation.
+    // If a barge-in happened, fireBargeIn already cleared isProcessing.
+    const current = activeSessions.get(callControlId)
+    if (current && current.generation === myGeneration) {
+      current.isProcessing = false
+    }
   }
 }
 
-async function speakToProspect(callControlId: string, text: string, onFirstChunk?: () => void) {
+// ─── Audio output ─────────────────────────────────────────────────────────────
+// Streams TTS audio to Telnyx for a single text block.
+// Generation is checked:
+//   1. Before starting (don't begin stale speech)
+//   2. On every audio chunk (drop stale chunks mid-stream)
+//   3. Before sending the mark (don't track playback for stale audio)
+async function speakText(
+  callControlId: string,
+  text: string,
+  myGeneration: number,
+  onFirstChunk?: () => void,
+): Promise<void> {
   const data = activeSessions.get(callControlId)
   if (!data) return
 
-  const { session, ws, platformSettings } = data
-  if (!platformSettings) return
+  // Drop immediately if a barge-in already superseded this generation
+  if (data.generation !== myGeneration) return
 
-  // Track what the agent is saying so fireBargeIn can recover if it was a false interrupt.
+  const { platformSettings, ws } = data
+  if (!platformSettings || !ws || ws.readyState !== WebSocket.OPEN) return
+
+  // Track what the agent is saying — used by false barge-in recovery
   data.currentSpeakingText = text
 
-  session.transcript.push({ role: 'agent', text, timestamp: new Date().toISOString() })
-  console.log(`[Pipeline] Agent: "${text}"`)
+  const ttsProvider = (data.session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram'
+  const ttsApiKey   = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_api_key : platformSettings.deepgram_api_key
+  const ttsVoiceId  = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined
 
-  // Provider selection: agent field wins, falls back to global setting
-  const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'google'
-  const ttsApiKey   = ttsProvider === 'elevenlabs'
-    ? platformSettings.elevenlabs_api_key
-    : platformSettings.deepgram_api_key
+  const ttsAbort  = new AbortController()
+  data.ttsAbortController = ttsAbort
 
-  const abortController = new AbortController()
   const markId = `tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-  // Add markId BEFORE the TTS fetch — prevents race where Telnyx echoes an old mark
-  // back while this fetch is in-flight, which would clear isSpeaking prematurely.
   data.pendingMarkIds.add(markId)
-  data.currentTtsAbort = abortController
   data.isSpeaking = true
 
   try {
-    // Stream TTS audio chunks to Telnyx as they arrive — no waiting for full MP3
-    const costUsd = await streamTextToSpeech({
-      provider: ttsProvider,
-      apiKey: ttsApiKey,
-      voiceId: ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined,
+    const cost = await streamTextToSpeech({
+      provider:      ttsProvider,
+      apiKey:        ttsApiKey,
+      voiceId:       ttsVoiceId,
       text,
-      abortSignal: abortController.signal,
-      // Fallback: if ElevenLabs returns 402/429/5xx, automatically serve via Deepgram Aura.
+      abortSignal:   ttsAbort.signal,
       fallbackApiKey: ttsProvider === 'elevenlabs' ? platformSettings.deepgram_api_key : undefined,
+
       onChunk: (base64Audio) => {
+        // Generation check on every single chunk — stale audio is never sent
+        const current = activeSessions.get(callControlId)
+        if (!current || current.generation !== myGeneration) return
+
         onFirstChunk?.()
-        if (ws && ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
+        if (current.ws?.readyState === WebSocket.OPEN) {
+          current.ws!.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
         }
       },
     })
-    data.costTts += costUsd
-    console.log(`[Cost] TTS +$${costUsd.toFixed(6)} (total TTS: $${data.costTts.toFixed(6)})`)
-    // All audio bytes sent to Telnyx — but Telnyx hasn't finished playing yet.
-    // Send the mark now: Telnyx echoes it back when the last audio chunk finishes playing.
-    // isSpeaking stays true until onTelnyxMark() fires and the Set becomes empty.
-    if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ event: 'mark', stream_id: data.telnyxStreamId, mark: { name: markId } }))
+
+    // Only record cost and send mark if still current generation
+    const current = activeSessions.get(callControlId)
+    if (current && current.generation === myGeneration) {
+      current.costTts += cost
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ event: 'mark', stream_id: data.telnyxStreamId, mark: { name: markId } }))
+      }
+    } else {
+      // Stale — remove mark so isSpeaking can clear correctly
+      data.pendingMarkIds.delete(markId)
+      if (data.pendingMarkIds.size === 0) data.isSpeaking = false
     }
-  } catch (ttsError) {
-    if (ttsError instanceof Error && ttsError.name === 'AbortError') {
-      console.log(`[Pipeline] TTS aborted (barge-in) ${callControlId}`)
-      return  // barge-in already cleared the Set via fireBargeIn — don't end the call
-    }
-    const msg = ttsError instanceof Error ? ttsError.message : String(ttsError)
-    logger.error('tts', `TTS failed — ending call: ${msg}`, { callId: data.session?.callId })
-    // Remove this mark since no audio was sent and no mark event will arrive from Telnyx
+
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return  // barge-in — clean exit, no error
+
+    const msg = err instanceof Error ? err.message : String(err)
+    logger.error('tts', `TTS failed: ${msg}`, { callId: data.session?.callId })
     data.pendingMarkIds.delete(markId)
     if (data.pendingMarkIds.size === 0) data.isSpeaking = false
-    // End the call immediately — the prospect would hear silence otherwise
     endSession(callControlId, 'error')
+
   } finally {
-    if (data.currentTtsAbort === abortController) {
-      data.currentTtsAbort = null
-      // isSpeaking intentionally NOT cleared here — onTelnyxMark() clears it when Telnyx finishes playing
+    if (data.ttsAbortController === ttsAbort) data.ttsAbortController = null
+  }
+}
+
+// ─── Telnyx mark handler ──────────────────────────────────────────────────────
+// Telnyx echoes a mark back when all audio before it has finished playing.
+// This is the only reliable signal that the prospect can now hear silence.
+// isSpeaking stays true until the last pending mark returns.
+export function onTelnyxMark(callControlId: string, markName: string) {
+  const d = activeSessions.get(callControlId)
+  if (!d) return
+
+  if (d.pendingMarkIds.has(markName)) {
+    d.pendingMarkIds.delete(markName)
+    if (d.pendingMarkIds.size === 0) {
+      d.isSpeaking         = false
+      d.currentSpeakingText = null   // fully played — no recovery needed
+      console.log(`[Pipeline] Playback complete — last mark: ${markName}`)
     }
   }
 }
 
+// ─── Session teardown ─────────────────────────────────────────────────────────
+// Handles all cleanup: STT, noise suppression, timers, DB updates, retry scheduling.
+// Exported for use by index.ts webhook handlers and the max-duration timer.
 export async function endSession(callControlId: string, outcome: string) {
   const data = activeSessions.get(callControlId)
   if (!data) return
 
-  // Remove immediately — prevents concurrent calls (stop event + ws.close + hangup webhook)
-  // all firing before the first async endSession completes
+  // Remove first — prevents concurrent endSession calls (hangup + WS close + stop)
   activeSessions.delete(callControlId)
-
   console.log(`[Pipeline] Ending ${callControlId} — outcome: ${outcome}`)
 
   const { session, sttStream, maxDurationTimer } = data
 
-  // Stop recording (fire-and-forget) — Telnyx finalises the file and sends
-  // call.recording.saved webhook with the download URL. 422/404 are safe to ignore.
+  // Abort any in-flight operations
+  data.llmAbortController?.abort()
+  data.ttsAbortController?.abort()
+  data.speculativeAbort?.abort()
+
+  // Stop recording (fire-and-forget — Telnyx finalises and sends webhook)
   if (data.platformSettings?.recording_enabled && data.platformSettings.telnyx_api_key) {
     stopRecording(callControlId, data.platformSettings.telnyx_api_key)
-      .catch(err => logger.error('recording', `stopRecording error: ${String(err)}`, { callId: data.session?.callId }))
+      .catch(err => logger.error('recording', `stopRecording error: ${String(err)}`, { callId: session?.callId }))
   }
 
-  if (maxDurationTimer) clearTimeout(maxDurationTimer)
+  if (maxDurationTimer)      clearTimeout(maxDurationTimer)
   if (data.falseBargeInTimer) clearTimeout(data.falseBargeInTimer)
-  if (sttStream) sttStream.close()
-  // Free the RNNoise state for this session — prevents memory leak over many calls
+  if (sttStream)              sttStream.close()
   destroyNoiseSuppressionState(data.denoisingSessionId)
 
   const durationSeconds = Math.floor(
-    (Date.now() - new Date(session.startTime).getTime()) / 1000
+    (Date.now() - new Date(session.startTime).getTime()) / 1000,
   )
 
-  // Calculate STT cost from total audio bytes processed
-  const costStt = data.sttAudioBytes * DEEPGRAM_STT_PER_BYTE
-  // cost_telephony will be added later by the call.cost webhook from Telnyx
+  const costStt   = data.sttAudioBytes * DEEPGRAM_STT_PER_BYTE
   const costTotal = data.costLlm + data.costTts + costStt
 
-  console.log(`[Cost] Call ${callControlId} — LLM: $${data.costLlm.toFixed(6)} | TTS: $${data.costTts.toFixed(6)} | STT: $${costStt.toFixed(6)} | Total (excl. telephony): $${costTotal.toFixed(6)}`)
+  console.log(
+    `[Cost] ${callControlId} — LLM: $${data.costLlm.toFixed(6)} | TTS: $${data.costTts.toFixed(6)} | STT: $${costStt.toFixed(6)} | Total: $${costTotal.toFixed(6)}`,
+  )
 
   if (data.latencyMeasurements.length > 0) {
     const avg = Math.round(data.latencyMeasurements.reduce((a, b) => a + b, 0) / data.latencyMeasurements.length)
     const min = Math.min(...data.latencyMeasurements)
     const max = Math.max(...data.latencyMeasurements)
-    console.log(`[Latency] Call ${callControlId} — avg: ${avg}ms | min: ${min}ms | max: ${max}ms | turns measured: ${data.latencyMeasurements.length}`)
+    console.log(`[Latency] avg: ${avg}ms | min: ${min}ms | max: ${max}ms | turns: ${data.latencyMeasurements.length}`)
   }
 
   const leadStatus =
-    outcome === 'interested' ? 'interested' :
-    outcome === 'not_interested' ? 'not_interested' :
-    outcome === 'callback_request' ? 'callback' :
-    outcome === 'wrong_person' ? 'wrong_person' : 'no_answer'
+    outcome === 'interested'       ? 'interested'    :
+    outcome === 'not_interested'   ? 'not_interested' :
+    outcome === 'callback_request' ? 'callback'      :
+    outcome === 'wrong_person'     ? 'wrong_person'  : 'no_answer'
 
   await Promise.all([
     supabase.from('calls').update({
-      status: 'completed', outcome,
+      status:           'completed',
+      outcome,
       duration_seconds: durationSeconds,
-      transcript: session.transcript,
-      ended_at: new Date().toISOString(),
-      cost_llm: data.costLlm,
-      cost_tts: data.costTts,
-      cost_stt: costStt,
-      cost_total: costTotal,
+      transcript:       session.transcript,
+      ended_at:         new Date().toISOString(),
+      cost_llm:         data.costLlm,
+      cost_tts:         data.costTts,
+      cost_stt:         costStt,
+      cost_total:       costTotal,
     }).eq('id', session.callId),
 
-    supabase.from('leads').update({ status: leadStatus }).eq('id', session.leadId),
+    supabase.from('leads')
+      .update({ status: leadStatus })
+      .eq('id', session.leadId),
   ])
 
-  // Batch dialer retry: if this call was part of a campaign and the outcome is
-  // retry-eligible (e.g. no_answer), reset the lead to 'pending' with a
-  // scheduled_after timestamp so the dialer picks it up again after the delay.
   if (session.campaignId) {
     await scheduleRetryIfNeeded(session.leadId, session.campaignId, outcome)
       .catch(err => console.error('[Dialer] Retry scheduling error:', err))
   }
 
-  console.log(`[Pipeline] Session cleaned up: ${callControlId}`)
+  console.log(`[Pipeline] Cleaned up: ${callControlId}`)
 }
 
-// ─── Batch dialer retry scheduling ───────────────────────────────────────────
-// Called after every campaign call ends. If the outcome matches the campaign's
-// retry_outcomes list AND retries remain, reset the lead to 'pending' with
-// scheduled_after set to now + retry_delay_minutes.
-// The dialer loop skips leads where scheduled_after > now, so the retry
-// happens automatically at the right time without any polling overhead.
+// ─── Telephony cost update ────────────────────────────────────────────────────
+// Called from index.ts when Telnyx sends the call.cost webhook.
+export async function updateTelephonyCost(callControlId: string, costTelephony: number) {
+  const { data: call, error } = await supabase
+    .from('calls')
+    .select('cost_llm, cost_stt, cost_tts')
+    .eq('telephony_call_id', callControlId)
+    .single()
+
+  if (error || !call) {
+    console.error(`[Cost] Lookup failed for ${callControlId}:`, error?.message ?? 'no row')
+    return
+  }
+
+  const costTotal = costTelephony + (call.cost_llm || 0) + (call.cost_stt || 0) + (call.cost_tts || 0)
+  await supabase.from('calls')
+    .update({ cost_telephony: costTelephony, cost_total: costTotal })
+    .eq('telephony_call_id', callControlId)
+
+  console.log(`[Cost] Telephony: $${costTelephony.toFixed(6)} — Final total: $${costTotal.toFixed(6)}`)
+}
+
+// ─── Campaign retry scheduling ────────────────────────────────────────────────
+// After a call ends: if the outcome matches the campaign's retry list AND
+// retries remain, reset the lead to 'pending' with scheduled_after in the future.
+// The dialer picks it up automatically when the window opens.
 async function scheduleRetryIfNeeded(leadId: string, campaignId: string, outcome: string): Promise<void> {
   const [{ data: campaign }, { data: lead }] = await Promise.all([
     supabase.from('campaigns')
@@ -688,8 +812,8 @@ async function scheduleRetryIfNeeded(leadId: string, campaignId: string, outcome
   if (!campaign || !lead) return
 
   const retryOutcomes: string[] = campaign.retry_outcomes ?? ['no_answer']
-  if (!retryOutcomes.includes(outcome)) return              // terminal outcome — no retry
-  if ((lead.retry_count ?? 0) >= campaign.retry_attempts) return  // retries exhausted
+  if (!retryOutcomes.includes(outcome))                    return
+  if ((lead.retry_count ?? 0) >= campaign.retry_attempts) return
 
   const newRetryCount  = (lead.retry_count ?? 0) + 1
   const scheduledAfter = new Date(Date.now() + campaign.retry_delay_minutes * 60_000)
@@ -700,44 +824,5 @@ async function scheduleRetryIfNeeded(leadId: string, campaignId: string, outcome
     scheduled_after: scheduledAfter.toISOString(),
   }).eq('id', leadId)
 
-  console.log(`[Dialer] Retry ${newRetryCount}/${campaign.retry_attempts} scheduled for lead ${leadId} at ${scheduledAfter.toISOString()} (outcome: ${outcome})`)
-}
-
-// Called from index.ts when Telnyx echoes back a mark — signals true end of audio playback on the call.
-// This is how we know the prospect can hear silence and barge-in window is actually over.
-export function onTelnyxMark(callControlId: string, markName: string) {
-  const d = activeSessions.get(callControlId)
-  if (!d) return
-  if (d.pendingMarkIds.has(markName)) {
-    d.pendingMarkIds.delete(markName)
-    if (d.pendingMarkIds.size === 0) {
-      d.isSpeaking = false
-      d.currentSpeakingText = null  // audio fully played — no recovery needed anymore
-      console.log(`[Pipeline] Telnyx playback complete — last mark: ${markName}`)
-    } else {
-      console.log(`[Pipeline] Telnyx mark received (${d.pendingMarkIds.size} still pending): ${markName}`)
-    }
-  }
-}
-
-// Called from index.ts when Telnyx call.cost webhook arrives
-// Telnyx sends the exact telephony charge after the call ends
-export async function updateTelephonyCost(callControlId: string, costTelephony: number) {
-  const { data: call, error } = await supabase
-    .from('calls')
-    .select('cost_llm, cost_stt, cost_tts')
-    .eq('telephony_call_id', callControlId)
-    .single()
-
-  if (error || !call) {
-    console.error(`[Cost] call.cost DB lookup failed for call_control_id=${callControlId}:`, error?.message ?? 'no row found')
-    return
-  }
-
-  const costTotal = costTelephony + (call.cost_llm || 0) + (call.cost_stt || 0) + (call.cost_tts || 0)
-  await supabase.from('calls')
-    .update({ cost_telephony: costTelephony, cost_total: costTotal })
-    .eq('telephony_call_id', callControlId)
-
-  console.log(`[Cost] Telnyx telephony: $${costTelephony.toFixed(6)} — Final total: $${costTotal.toFixed(6)}`)
+  console.log(`[Dialer] Retry ${newRetryCount}/${campaign.retry_attempts} scheduled for lead ${leadId} at ${scheduledAfter.toISOString()}`)
 }
