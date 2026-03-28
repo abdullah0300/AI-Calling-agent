@@ -37,6 +37,8 @@ export interface STTStreamConfig {
   // Called when Flux fires TurnResumed — user continued speaking after EagerEndOfTurn.
   // Pipeline must cancel any speculative LLM generation started in onEagerEndOfTurn.
   onTurnResumed?: () => void
+  // Surface fatal STT errors (auth failure, exhausted retries) to the pipeline.
+  onError?: (error: Error) => void
 }
 
 export function createSTTStream(config: STTStreamConfig) {
@@ -227,7 +229,7 @@ function createNovaStream(config: STTStreamConfig) {
   // Quick auth check before attempting WebSocket
   fetch('https://api.deepgram.com/v1/projects', {
     headers: { Authorization: `Token ${config.apiKey}` },
-  }).then(r => {
+  }).then((r: Response) => {
     if (!r.ok) {
       console.error(`[STT/Nova] Key check failed — HTTP ${r.status}.${r.status === 401 ? ' Invalid key.' : r.status === 402 ? ' No credits.' : ''}`)
     }
@@ -349,9 +351,3 @@ function createNovaStream(config: STTStreamConfig) {
   }
 }
 
-// Attach onError to config interface for clean typing
-declare module './stt' {
-  interface STTStreamConfig {
-    onError?: (error: Error) => void
-  }
-}
