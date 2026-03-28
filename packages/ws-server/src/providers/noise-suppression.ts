@@ -32,9 +32,13 @@ export async function initNoiseSuppression(): Promise<void> {
   if (initPromise)   return initPromise
   initPromise = (async () => {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const createRNNoise = require('@jitsi/rnnoise-wasm')
-      wasmModule = await createRNNoise()
+      // @jitsi/rnnoise-wasm is an ESM package. require() fails on Node 22 because
+      // the package's index.js uses extension-less ESM imports internally which
+      // the CJS resolver cannot resolve (ERR_MODULE_NOT_FOUND in Cloud Run).
+      // Dynamic import() uses the ESM resolver and loads it correctly.
+      const mod = await import('@jitsi/rnnoise-wasm')
+      const createRNNoise = typeof mod.default === 'function' ? mod.default : mod
+      wasmModule = await (createRNNoise as () => Promise<any>)()
       console.log('[NoiseSuppression] RNNoise WASM loaded — denoising active')
     } catch (err) {
       console.warn('[NoiseSuppression] RNNoise WASM unavailable — running without denoising:', err)
