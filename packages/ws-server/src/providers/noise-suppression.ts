@@ -36,7 +36,8 @@ export async function initNoiseSuppression(): Promise<void> {
       // the package's index.js uses extension-less ESM imports internally which
       // the CJS resolver cannot resolve (ERR_MODULE_NOT_FOUND in Cloud Run).
       // Dynamic import() uses the ESM resolver and loads it correctly.
-      const mod = await import('@jitsi/rnnoise-wasm')
+      // @ts-ignore — no type declarations published for this package
+      const mod = await import('@jitsi/rnnoise-wasm') as any
       const createRNNoise = typeof mod.default === 'function' ? mod.default : mod
       wasmModule = await (createRNNoise as () => Promise<any>)()
       console.log('[NoiseSuppression] RNNoise WASM loaded — denoising active')
