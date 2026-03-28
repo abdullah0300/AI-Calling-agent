@@ -81,6 +81,25 @@ function isBackchannelOnly(text: string): boolean {
   return words.every(w => BACKCHANNEL_WORDS.has(w))
 }
 
+// ─── Text-layer AEC (Acoustic Echo Cancellation) ─────────────────────────────
+// When the agent is speaking, the prospect's phone speaker plays the agent's
+// voice. If the prospect is on speakerphone or has a poor handset, that audio
+// is picked up by their mic and echoed back to us via Telnyx. RNNoise does not
+// suppress this (it handles steady-state noise, not speech-frequency echo).
+//
+// Solution: compare the incoming STT transcript against the agent's current
+// speech text. If >50% of the incoming words exist in the agent's text, treat
+// it as echo and suppress. This requires no signal processing — pure text match.
+function isEchoTranscript(incoming: string, agentText: string | null): boolean {
+  if (!agentText) return false
+  const inWords  = incoming.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean)
+  const agWords  = new Set(agentText.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean))
+  if (inWords.length === 0 || agWords.size === 0) return false
+  const matchCount = inWords.filter(w => agWords.has(w)).length
+  // >50% of incoming words found in agent text → echo
+  return matchCount / inWords.length > 0.5
+}
+
 // ─── Session state ────────────────────────────────────────────────────────────
 interface ActiveSession {
   session:             CallSession
@@ -113,6 +132,11 @@ interface ActiveSession {
   // If no transcript arrives within 2s after barge-in, it was noise.
   // Timer fires → agent resumes from currentSpeakingText (same generation).
   falseBargeInTimer: NodeJS.Timeout | null
+  // ── AEC echo gate ────────────────────────────────────────────────────────
+  // Set to true by onSpeechStarted when isSpeaking — instead of firing
+  // fireBargeIn immediately we wait for the transcript and run isEchoTranscript.
+  // Cleared in onTranscript: suppressed if echo, fires delayed barge-in if real.
+  pendingEchoBargeIn: boolean
 
   // ── Turn state ───────────────────────────────────────────────────────────
   isProcessing:    boolean              // true while LLM+TTS pipeline is running
@@ -159,6 +183,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     telnyxStreamId:       null,
     currentSpeakingText:  null,
     falseBargeInTimer:    null,
+    pendingEchoBargeIn:   false,
     isProcessing:         false,
     isStarted:            false,
     maxDurationTimer:     null,
@@ -194,7 +219,10 @@ export function attachWebSocket(callControlId: string, ws: WebSocket, streamId?:
 // LLM streams to speak again after the reset.
 function fireBargeIn(callControlId: string): void {
   const d = activeSessions.get(callControlId)
-  if (!d || !d.isSpeaking) return
+  // Fire on isSpeaking (audio playing) OR isProcessing (LLM generating).
+  // Previously only guarded on isSpeaking — interruptions during LLM generation
+  // were silently dropped, so the agent would speak over the prospect.
+  if (!d || (!d.isSpeaking && !d.isProcessing)) return
 
   const prevGen = d.generation
   d.generation++   // ← THE KEY LINE — invalidates all in-flight operations
@@ -281,6 +309,13 @@ export async function startSession(callControlId: string) {
     session.maxDuration * 1000,
   )
 
+  // Ensure WASM denoiser is loaded before the first audio chunk arrives.
+  // initNoiseSuppression() is idempotent — resolves immediately if already done.
+  // createNoiseSuppressionState is also idempotent — creates the per-call RNNoise
+  // state now if WASM wasn't ready during registerSession (race at startup).
+  await initNoiseSuppression()
+  createNoiseSuppressionState(data.denoisingSessionId)
+
   // Provider selection: agent-level setting overrides global platform setting
   const sttProvider = (session.agent.active_stt || platformSettings.active_stt) as 'deepgram' | 'google'
   const sttModel    = session.agent.active_stt_model || platformSettings.active_stt_model
@@ -292,18 +327,43 @@ export async function startSession(callControlId: string) {
 
     // Final transcript — commit LLM response
     onTranscript: async (text, isFinal) => {
-      if (isFinal && text.length > 3) {
-        // Cancel any pending false barge-in recovery — real speech confirmed
-        if (data.falseBargeInTimer) {
-          clearTimeout(data.falseBargeInTimer)
-          data.falseBargeInTimer = null
-        }
-        await handleProspectSpeech(callControlId, text)
+      if (!isFinal || text.length <= 3) return
+
+      // Cancel any pending false barge-in recovery — real speech confirmed
+      if (data.falseBargeInTimer) {
+        clearTimeout(data.falseBargeInTimer)
+        data.falseBargeInTimer = null
       }
+
+      // AEC resolution: onSpeechStarted set pendingEchoBargeIn instead of firing
+      // immediately. Now that we have the transcript, check if it is echo.
+      if (data.pendingEchoBargeIn) {
+        data.pendingEchoBargeIn = false
+        if (isEchoTranscript(text, data.currentSpeakingText)) {
+          console.log(`[Pipeline] AEC — echo suppressed: "${text}"`)
+          return  // agent's own voice reflected back — discard entirely
+        }
+        // Real speech confirmed — fire delayed barge-in if agent is still active
+        if (data.isSpeaking || data.isProcessing) {
+          fireBargeIn(callControlId)
+        }
+      }
+
+      await handleProspectSpeech(callControlId, text)
     },
 
-    // Barge-in signal — single source of truth (STT only, no parallel energy VAD)
-    onSpeechStarted: () => fireBargeIn(callControlId),
+    // Barge-in signal — single source of truth (STT only, no parallel energy VAD).
+    // When the agent IS speaking we do NOT fire immediately: the prospect's phone
+    // may echo the agent's own audio back (speakerphone, poor handset). Instead
+    // we set pendingEchoBargeIn and resolve it in onTranscript above once we
+    // have enough text to distinguish real speech from echo.
+    onSpeechStarted: () => {
+      if (data.isSpeaking) {
+        data.pendingEchoBargeIn = true
+        return
+      }
+      fireBargeIn(callControlId)
+    },
 
     // EagerEndOfTurn — start LLM speculatively to reduce response latency
     onEagerEndOfTurn: (transcript) => {
@@ -374,7 +434,7 @@ export async function handleAudioChunk(callControlId: string, audioBuffer: Buffe
 // Results are stored and reused by handleProspectSpeech if EndOfTurn arrives
 // with the same transcript. If TurnResumed fires first, the abort signal kills it.
 // This saves 150–250ms of LLM TTFT per turn.
-const speculativeResults = new Map<string, { text: string; sentences: string[] }>()
+const speculativeResults = new Map<string, { text: string; sentences: string[]; costUsd: number }>()
 
 async function runSpeculativeLLM(
   callControlId: string,
@@ -393,7 +453,7 @@ async function runSpeculativeLLM(
   const sentences: string[] = []
   let fullText = ''
 
-  await streamAgentResponse({
+  const result = await streamAgentResponse({
     provider: llmProvider,
     apiKey:   llmApiKey,
     model:    llmModel,
@@ -413,7 +473,9 @@ async function runSpeculativeLLM(
   })
 
   if (!signal.aborted) {
-    speculativeResults.set(`${callControlId}:${generation}`, { text: fullText, sentences })
+    // Store costUsd with the result so handleProspectSpeech can add it to costLlm
+    // when consuming the speculative result (previously cost was never tracked here)
+    speculativeResults.set(`${callControlId}:${generation}`, { text: fullText, sentences, costUsd: result.costUsd })
     console.log(`[Pipeline] Speculative LLM complete — ${sentences.length} sentences ready`)
   }
 }
@@ -516,7 +578,8 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
               if (!current || current.generation !== myGeneration) break
               await speakText(callControlId, sentence, myGeneration, onFirstChunk)
             }
-            responseText = speculativeResult.text
+            responseText   = speculativeResult.text
+            data.costLlm  += speculativeResult.costUsd  // track cost from speculative run
 
             // Clean up speculative state
             data.speculativeAbort      = null
@@ -710,6 +773,13 @@ export async function endSession(callControlId: string, outcome: string) {
   data.ttsAbortController?.abort()
   data.speculativeAbort?.abort()
 
+  // Remove any unused speculative results for this session.
+  // These accumulate when EndOfTurn fires a non-default scenario (voicemail,
+  // not_interested, etc.) and the default LLM path never runs to consume them.
+  for (const key of speculativeResults.keys()) {
+    if (key.startsWith(`${callControlId}:`)) speculativeResults.delete(key)
+  }
+
   // Stop recording (fire-and-forget — Telnyx finalises and sends webhook)
   if (data.platformSettings?.recording_enabled && data.platformSettings.telnyx_api_key) {
     stopRecording(callControlId, data.platformSettings.telnyx_api_key)
@@ -740,10 +810,11 @@ export async function endSession(callControlId: string, outcome: string) {
   }
 
   const leadStatus =
-    outcome === 'interested'       ? 'interested'    :
-    outcome === 'not_interested'   ? 'not_interested' :
-    outcome === 'callback_request' ? 'callback'      :
-    outcome === 'wrong_person'     ? 'wrong_person'  : 'no_answer'
+    outcome === 'interested'       ? 'interested'     :
+    outcome === 'not_interested'   ? 'not_interested'  :
+    outcome === 'callback_request' ? 'callback'        :
+    outcome === 'wrong_person'     ? 'wrong_person'    :
+    outcome === 'voicemail'        ? 'voicemail'       : 'no_answer'
 
   await Promise.all([
     supabase.from('calls').update({

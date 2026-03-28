@@ -51,6 +51,7 @@ const sessionStates = new Map<string, any>()
 
 export function createNoiseSuppressionState(sessionId: string): void {
   if (!wasmModule) return
+  if (sessionStates.has(sessionId)) return  // idempotent — safe to call multiple times
   try {
     sessionStates.set(sessionId, wasmModule.newState())
   } catch (err) {
