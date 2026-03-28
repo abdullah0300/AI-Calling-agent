@@ -29,10 +29,7 @@ export interface Agent {
   description: string | null
   system_prompt: string
   greeting_message: string
-  interest_detected_message: string
   not_interested_message: string
-  wrong_person_message: string
-  callback_message: string
   max_call_duration_seconds: number
   active_llm: LLMProvider
   active_llm_model: string

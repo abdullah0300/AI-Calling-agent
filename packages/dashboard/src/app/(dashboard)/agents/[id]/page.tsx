@@ -165,46 +165,19 @@ const MESSAGE_FIELDS = [
     field: 'greeting_message',
     label: 'Opening Greeting',
     emoji: '👋',
-    trigger: 'When call connects',
+    trigger: 'Spoken first — no LLM delay',
     placeholder:
       'Hello, is this the business? Hi, my name is Sarah from WebCraftio…',
-    hint: 'The very first thing the agent says when someone answers. Keep it natural, brief, and engaging.',
-  },
-  {
-    field: 'interest_detected_message',
-    label: 'Interest Detected',
-    emoji: '🎯',
-    trigger: 'When prospect shows interest',
-    placeholder:
-      "That's great to hear! I'll have one of our specialists call you back for a quick 10-minute demo…",
-    hint: 'Triggered when the AI detects genuine interest. Should immediately offer a next step (callback or demo).',
+    hint: 'The very first thing the agent says when someone answers. Sent directly to TTS — no LLM call, instant playback. Keep it natural and brief.',
   },
   {
     field: 'not_interested_message',
-    label: 'Not Interested',
+    label: 'Not Interested / DNC',
     emoji: '👍',
-    trigger: 'When prospect declines',
+    trigger: 'On "not interested" keywords',
     placeholder:
       'Absolutely no problem at all. Thanks so much for your time. Have a great day!',
-    hint: "Used when the prospect clearly isn't interested. Always stay polite and leave a positive impression.",
-  },
-  {
-    field: 'wrong_person_message',
-    label: 'Wrong Person',
-    emoji: '🔄',
-    trigger: 'When not the decision maker',
-    placeholder:
-      'Sorry about that! Who would be the right person to speak to about technology decisions in the business?',
-    hint: "Triggered when the call reaches someone who isn't the decision maker. Politely ask for a referral.",
-  },
-  {
-    field: 'callback_message',
-    label: 'Callback Request',
-    emoji: '📅',
-    trigger: 'When prospect asks to be called back',
-    placeholder:
-      "Of course, I completely understand. What time works better — morning or afternoon? And is there a specific person I should ask for?",
-    hint: "Used when the prospect asks to be reached at a better time. Capture their preferred slot and contact name.",
+    hint: 'Fires instantly when the prospect says a DNC phrase ("not interested", "remove me", "do not call", etc.). Bypasses the LLM entirely — immediate polite exit. All other objections (wrong person, callback, hesitation) are handled by the LLM via [Task] in the system prompt above.',
   },
 ]
 
@@ -215,10 +188,7 @@ const DEFAULT_AGENT: Partial<Agent> = {
   description: '',
   system_prompt: '',
   greeting_message: '',
-  interest_detected_message: '',
   not_interested_message: '',
-  wrong_person_message: '',
-  callback_message: '',
   max_call_duration_seconds: 180,
   active_llm: 'anthropic',
   active_llm_model: 'claude-haiku-4-5',
@@ -418,17 +388,20 @@ export default function AgentEditPage() {
         {/* ── Section 3: Conversation Scripts ── */}
         <Section
           number={3}
-          title="Conversation Scripts"
-          subtitle="Pre-scripted responses fired instantly by keyword detection — no LLM call, zero latency"
+          title="Instant Scripts"
+          subtitle="Two hard-coded messages that bypass the LLM entirely — spoken with zero latency"
           icon={<MessageSquare className="h-4 w-4 text-blue-600" />}
         >
           <div className="bg-amber-50 border border-amber-100 rounded-xl p-4 flex gap-3">
             <Info className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" />
-            <p className="text-xs text-amber-700 leading-relaxed">
-              These messages are triggered directly by the pipeline — no AI generation involved.
-              They fire instantly when keywords are detected (e.g. &quot;not interested&quot;, &quot;call back&quot;).
-              Keep them natural and match the voice in your system prompt.
-            </p>
+            <div className="text-xs text-amber-700 space-y-1">
+              <p className="font-semibold">No AI generation — instant playback</p>
+              <p className="leading-relaxed">
+                These two messages go straight to text-to-speech — the LLM is never called.
+                Everything else (wrong person, callback requests, hesitation, objections) is handled
+                by the LLM using the <strong>[Task]</strong> section in your system prompt above.
+              </p>
+            </div>
           </div>
 
           {MESSAGE_FIELDS.map(({ field, label, emoji, trigger, placeholder, hint }) => (

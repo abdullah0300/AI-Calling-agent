@@ -21,10 +21,7 @@ CREATE TABLE IF NOT EXISTS agents (
   description                 text,
   system_prompt               text        NOT NULL,
   greeting_message            text        NOT NULL,
-  interest_detected_message   text        NOT NULL,
   not_interested_message      text        NOT NULL,
-  wrong_person_message        text        NOT NULL,
-  callback_message            text        NOT NULL,
   max_call_duration_seconds   integer     NOT NULL DEFAULT 180,
   active_llm                  text        NOT NULL DEFAULT 'anthropic',
   active_llm_model            text        NOT NULL DEFAULT 'claude-haiku-4-5',
@@ -249,8 +246,7 @@ ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO agents (
   name, description, system_prompt, greeting_message,
-  interest_detected_message, not_interested_message,
-  wrong_person_message, callback_message,
+  not_interested_message,
   max_call_duration_seconds, active_llm, active_llm_model,
   active_tts, active_stt, active_telephony
 ) VALUES (
@@ -302,10 +298,7 @@ Your ONE JOB: Ask one good question. Listen carefully. If they show any interest
 - If silence for a few seconds: "Hello, are you still there?"
 - If voicemail detected: say nothing and end the call immediately',
   'Hi — am I speaking with the owner or manager of the agency? My name is Sarah from WebCraftio — we are a UK tech company. Quick question — how are you currently handling leads that call after hours or when your team is busy?',
-  'Brilliant — I will get one of our specialists to call you for a free 15 minute walkthrough. Does tomorrow morning or afternoon work better for you?',
   'Absolutely no problem — I appreciate your time. If things change our team is always available at webcraftio.com. Have a great day!',
-  'No problem at all — thanks for letting me know. Could I ask who handles technology decisions for the agency? And what is the best time to reach them?',
-  'Of course — sounds like now is not ideal. Would tomorrow morning work better? I can have a specialist call you at a time that suits you completely.',
   180, 'anthropic', 'claude-haiku-4-5', 'elevenlabs', 'deepgram', 'telnyx'
 ) ON CONFLICT DO NOTHING;
 
