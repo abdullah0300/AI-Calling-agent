@@ -353,6 +353,7 @@ If silence for a few seconds: "Hello, are you still there?"`}
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="cartesia">Cartesia Sonic-3 — Fastest &amp; cheapest</SelectItem>
                   <SelectItem value="elevenlabs">ElevenLabs — Most natural</SelectItem>
                   <SelectItem value="deepgram">Deepgram Aura — Fast &amp; cheap</SelectItem>
                   <SelectItem value="google">Google TTS</SelectItem>

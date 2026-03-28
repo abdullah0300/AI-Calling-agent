@@ -79,9 +79,10 @@ const providerConfig = [
     iconColor: 'text-emerald-600',
     description: "Converts the agent's text responses to spoken audio.",
     options: [
-      { value: 'elevenlabs', label: 'ElevenLabs',    note: 'Most natural voice' },
-      { value: 'deepgram',   label: 'Deepgram Aura', note: 'Fast & cost-efficient' },
-      { value: 'google',     label: 'Google TTS',    note: 'Alternative' },
+      { value: 'cartesia',   label: 'Cartesia Sonic-3', note: '~90ms latency · 8x cheaper than ElevenLabs' },
+      { value: 'elevenlabs', label: 'ElevenLabs',       note: 'Most natural voice' },
+      { value: 'deepgram',   label: 'Deepgram Aura',    note: 'Fast & cost-efficient' },
+      { value: 'google',     label: 'Google TTS',        note: 'Alternative' },
     ],
   },
   {
@@ -158,6 +159,29 @@ const apiKeyGroups = [
         label: 'Voice ID',
         placeholder: '21m00Tcm4TlvDq8ikWAM',
         hint: 'Voice ID from your ElevenLabs voice library (not a secret)',
+        isSecret: false,
+      },
+    ],
+  },
+  {
+    provider: 'Cartesia',
+    emoji: '⚡',
+    borderColor: 'border-orange-200',
+    headerBg: 'bg-orange-50',
+    description: 'Used for Cartesia Sonic-3 TTS — ~90ms latency, ~8x cheaper than ElevenLabs',
+    keys: [
+      {
+        key: 'cartesia_api_key',
+        label: 'API Key',
+        placeholder: 'YOUR_CARTESIA_API_KEY',
+        hint: 'Found in cartesia.ai → Settings → API Keys',
+        isSecret: true,
+      },
+      {
+        key: 'cartesia_voice_id',
+        label: 'Voice ID',
+        placeholder: 'a0e99841-438c-4a64-b679-ae501e7d6091',
+        hint: 'Voice UUID from your Cartesia voice library. Default is Barbershop Man (English).',
         isSecret: false,
       },
     ],

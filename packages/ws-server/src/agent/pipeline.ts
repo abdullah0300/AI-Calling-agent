@@ -688,9 +688,13 @@ async function speakText(
   // Track what the agent is saying — used by false barge-in recovery
   data.currentSpeakingText = text
 
-  const ttsProvider = (data.session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram'
-  const ttsApiKey   = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_api_key : platformSettings.deepgram_api_key
-  const ttsVoiceId  = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined
+  const ttsProvider = (data.session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram' | 'cartesia'
+  const ttsApiKey   = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_api_key
+                    : ttsProvider === 'cartesia'   ? platformSettings.cartesia_api_key
+                    : platformSettings.deepgram_api_key
+  const ttsVoiceId  = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id
+                    : ttsProvider === 'cartesia'   ? platformSettings.cartesia_voice_id
+                    : undefined
 
   const ttsAbort  = new AbortController()
   data.ttsAbortController = ttsAbort
