@@ -1,42 +1,37 @@
-export type ScenarioType =
-  | 'voicemail' | 'not_interested' | 'wrong_person'
-  | 'interested' | 'callback_request' | 'unknown'
+export type ScenarioType = 'voicemail' | 'not_interested' | 'llm'
 
+// Two hard exits — everything else goes directly to the LLM.
+//
+// voicemail: the LLM must never try to respond to a machine greeting.
+//   Instant silent hang-up is the only correct action.
+//
+// not_interested: compliance and legal signal. "Don't call me", "remove me",
+//   "stop calling" must be respected without argument. Sending these to the LLM
+//   risks it trying to overcome the objection, which is a regulatory problem.
+//
+// Everything else — wrong person, callback request, questions, objections,
+// interest signals, confusion — the LLM handles far better than a phrase list.
+// Keyword matching cannot understand context: "yes" inside "yes but I already
+// have a provider" is not the same as a standalone "yes".
 export function detectScenario(transcript: string): ScenarioType {
   const text = transcript.toLowerCase().trim()
 
-  const voicemailPhrases = ['leave a message', 'after the tone', 'voicemail', 'not available to take your call']
+  const voicemailPhrases = [
+    'leave a message', 'after the tone', 'voicemail',
+    'not available to take your call', 'please leave a message',
+  ]
   if (voicemailPhrases.some(p => text.includes(p))) return 'voicemail'
 
   const notInterestedPhrases = [
-    'not interested', 'no thank you', 'no thanks', 'please remove',
-    "don't call", 'stop calling', 'not looking', 'bye', 'goodbye'
-    // NOTE: "already have" is intentionally excluded — it is an objection to handle,
-    // not a flat rejection. The [Task] section script addresses it directly.
+    'not interested', 'no thank you', 'no thanks',
+    'please remove', "don't call", 'stop calling',
+    'do not call', 'remove me', 'take me off',
+    // 'bye' intentionally excluded — substring matches "maybe", "hereby" etc.
+    // 'already have' intentionally excluded — objection for LLM to handle.
   ]
   if (notInterestedPhrases.some(p => text.includes(p))) return 'not_interested'
 
-  const wrongPersonPhrases = [
-    'not the right person', 'not my department', 'speak to', 'talk to',
-    "i'll pass", 'not in', 'not here', "i'm just", "i only",
-    'front desk', 'receptionist', 'manager is', 'owner is', 'director is'
-  ]
-  if (wrongPersonPhrases.some(p => text.includes(p))) return 'wrong_person'
-
-  const callbackPhrases = [
-    'call back', 'call me back', 'better time', 'later',
-    'busy right now', 'in a meeting', 'bad time', 'ring me'
-  ]
-  if (callbackPhrases.some(p => text.includes(p))) return 'callback_request'
-
-  const interestedPhrases = [
-    'tell me more', 'interested', 'sounds good', 'yes', 'yeah',
-    'absolutely', 'definitely', 'how much', 'what does it cost',
-    'how does it work', 'book a meeting', 'demo', 'sounds interesting', 'go on'
-  ]
-  if (interestedPhrases.some(p => text.includes(p))) return 'interested'
-
-  return 'unknown'
+  return 'llm'
 }
 
 interface LeadContext {

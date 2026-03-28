@@ -142,6 +142,11 @@ interface ActiveSession {
   isProcessing:    boolean              // true while LLM+TTS pipeline is running
   isStarted:       boolean              // guard against double-start
   maxDurationTimer: NodeJS.Timeout | null
+  // If a transcript arrives while isProcessing is true, save it here.
+  // handleProspectSpeech picks it up in its finally block and processes it
+  // after the current turn completes. Only the most recent transcript is kept —
+  // if two arrive while processing, the older one is irrelevant.
+  pendingTranscript: string | null
 
   // ── Speculative generation (EagerEndOfTurn) ──────────────────────────────
   // When Flux fires EagerEndOfTurn, we start the LLM speculatively.
@@ -187,6 +192,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     isProcessing:         false,
     isStarted:            false,
     maxDurationTimer:     null,
+    pendingTranscript:    null,
     speculativeAbort:     null,
     speculativeTranscript: null,
     costLlm:              0,
@@ -487,13 +493,24 @@ async function runSpeculativeLLM(
 // operation drops silently and the function exits cleanly.
 async function handleProspectSpeech(callControlId: string, transcript: string) {
   const data = activeSessions.get(callControlId)
-  if (!data || data.isProcessing) return
+  if (!data) return
 
   if (isBackchannelOnly(transcript)) {
     console.log(`[Pipeline] Backchannel ignored: "${transcript}"`)
     return
   }
 
+  // If we're already processing a turn, queue this transcript.
+  // The finally block will pick it up once the current turn completes.
+  // Only the most recent transcript is kept — older ones are irrelevant.
+  if (data.isProcessing) {
+    data.pendingTranscript = transcript
+    console.log(`[Pipeline] Queued transcript (processing): "${transcript}"`)
+    return
+  }
+
+  // Clear any stale queued transcript — we are processing a fresh one
+  data.pendingTranscript = null
   data.isProcessing  = true
   const myGeneration = data.generation   // ← captured here, checked everywhere below
   const turnStart    = Date.now()
@@ -514,120 +531,101 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     session.transcript.push({ role: 'prospect', text: transcript, timestamp: new Date().toISOString() })
     console.log(`[Pipeline] Prospect (gen ${myGeneration}): "${transcript}"`)
 
-    const scenario    = detectScenario(transcript)
-    let responseText  = ''
+    const scenario   = detectScenario(transcript)
+    let responseText = ''
 
-    switch (scenario) {
+    // Hard exit: voicemail — never speak to a machine
+    if (scenario === 'voicemail') {
+      await endSession(callControlId, 'voicemail')
+      return
+    }
 
-      case 'voicemail':
-        await endSession(callControlId, 'voicemail')
-        return
+    // Hard exit: legal/compliance — must not be argued with
+    if (scenario === 'not_interested') {
+      responseText = session.agent.not_interested_message
+      await speakText(callControlId, responseText, myGeneration, onFirstChunk)
+      setTimeout(() => endSession(callControlId, 'not_interested'), 4000)
+      return
+    }
 
-      case 'not_interested':
-        responseText = session.agent.not_interested_message
-        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
-        setTimeout(() => endSession(callControlId, 'not_interested'), 4000)
-        return
+    // Everything else → LLM.
+    // Wrong person, callback requests, objections, questions, interest signals —
+    // all handled by the LLM. Keyword matching cannot understand context and
+    // was the root cause of the agent ignoring what the prospect actually said.
+    {
+      const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
+      const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
+      const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : platformSettings.anthropic_api_key
 
-      case 'interested':
-        responseText = session.agent.interest_detected_message
-        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
-        setTimeout(() => endSession(callControlId, 'interested'), 6000)
-        return
+      // Check if a speculative result is ready from EagerEndOfTurn
+      const speculativeKey    = `${callControlId}:${myGeneration}`
+      const speculativeResult = speculativeResults.get(speculativeKey)
+      speculativeResults.delete(speculativeKey)
 
-      case 'wrong_person':
-        responseText = session.agent.wrong_person_message
-        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
-        break
+      // Clean up any still-running speculative LLM for this turn
+      if (data.speculativeAbort && data.speculativeTranscript === transcript) {
+        // Let it finish — we'll use the result
+      } else if (data.speculativeAbort) {
+        // Different transcript from speculation — abort it
+        data.speculativeAbort.abort()
+        data.speculativeAbort      = null
+        data.speculativeTranscript = null
+      }
 
-      case 'callback_request':
-        responseText = session.agent.callback_message
-        await speakText(callControlId, responseText, myGeneration, onFirstChunk)
-        break
+      try {
+        if (speculativeResult) {
+          // ── Fast path: speculative result ready — speak sentences immediately ──
+          console.log(`[Pipeline] Using speculative result (${speculativeResult.sentences.length} sentences)`)
+          for (const sentence of speculativeResult.sentences) {
+            const current = activeSessions.get(callControlId)
+            if (!current || current.generation !== myGeneration) break
+            await speakText(callControlId, sentence, myGeneration, onFirstChunk)
+          }
+          responseText   = speculativeResult.text
+          data.costLlm  += speculativeResult.costUsd
 
-      default: {
-        const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
-        const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
-        const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : platformSettings.anthropic_api_key
-
-        // Check if a speculative result is ready from EagerEndOfTurn
-        const speculativeKey    = `${callControlId}:${myGeneration}`
-        const speculativeResult = speculativeResults.get(speculativeKey)
-        speculativeResults.delete(speculativeKey)
-
-        // Clean up any still-running speculative LLM for this turn
-        if (data.speculativeAbort && data.speculativeTranscript === transcript) {
-          // Let it finish — we'll use the result
-        } else if (data.speculativeAbort) {
-          // Different transcript from speculation — abort it
-          data.speculativeAbort.abort()
           data.speculativeAbort      = null
           data.speculativeTranscript = null
-        }
 
-        try {
-          const ttsProvider = (session.agent.active_tts || platformSettings.active_tts) as 'elevenlabs' | 'deepgram'
-          const ttsApiKey   = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_api_key : platformSettings.deepgram_api_key
-          const ttsVoiceId  = ttsProvider === 'elevenlabs' ? platformSettings.elevenlabs_voice_id : undefined
+        } else {
+          // ── Normal path: stream LLM tokens → TTS sentence by sentence ──────
+          const llmAbort          = new AbortController()
+          data.llmAbortController = llmAbort
 
-          if (speculativeResult) {
-            // ── Fast path: speculative result ready — speak sentences immediately ──
-            console.log(`[Pipeline] Using speculative result (${speculativeResult.sentences.length} sentences)`)
-            for (const sentence of speculativeResult.sentences) {
+          const result = await streamAgentResponse({
+            provider:    llmProvider,
+            apiKey:      llmApiKey,
+            model:       llmModel,
+            systemPrompt: buildSystemPrompt(session.agent.system_prompt, {
+              businessName: session.lead.business_name,
+              industry:     session.lead.industry,
+              city:         session.lead.city || undefined,
+            }),
+            conversationHistory,
+            userMessage: transcript,
+            abortSignal: llmAbort.signal,
+
+            onSentence: async (sentence) => {
               const current = activeSessions.get(callControlId)
-              if (!current || current.generation !== myGeneration) break
+              if (!current || current.generation !== myGeneration) return
               await speakText(callControlId, sentence, myGeneration, onFirstChunk)
-            }
-            responseText   = speculativeResult.text
-            data.costLlm  += speculativeResult.costUsd  // track cost from speculative run
+            },
+          })
 
-            // Clean up speculative state
-            data.speculativeAbort      = null
-            data.speculativeTranscript = null
-
-          } else {
-            // ── Normal path: stream LLM tokens → TTS sentence by sentence ─────────
-            const llmAbort        = new AbortController()
-            data.llmAbortController = llmAbort
-
-            const result = await streamAgentResponse({
-              provider:    llmProvider,
-              apiKey:      llmApiKey,
-              model:       llmModel,
-              systemPrompt: buildSystemPrompt(session.agent.system_prompt, {
-                businessName: session.lead.business_name,
-                industry:     session.lead.industry,
-                city:         session.lead.city || undefined,
-              }),
-              conversationHistory,
-              userMessage: transcript,
-              abortSignal: llmAbort.signal,
-
-              onSentence: async (sentence) => {
-                // Generation check — barge-in increments generation, making
-                // myGeneration stale. Old sentences are silently dropped here.
-                const current = activeSessions.get(callControlId)
-                if (!current || current.generation !== myGeneration) return
-                await speakText(callControlId, sentence, myGeneration, onFirstChunk)
-              },
-            })
-
-            if (data.generation === myGeneration) {
-              responseText    = result.text
-              data.costLlm   += result.costUsd
-              data.llmAbortController = null
-            }
-          }
-
-        } catch (llmErr: any) {
-          if (llmErr?.name === 'AbortError') return  // barge-in — clean exit
-          logger.error('pipeline', `LLM error: ${llmErr}`, { callId: session.callId })
           if (data.generation === myGeneration) {
-            responseText = "Could you repeat that? I did not quite catch it."
-            await speakText(callControlId, responseText, myGeneration)
+            responseText            = result.text
+            data.costLlm           += result.costUsd
+            data.llmAbortController = null
           }
         }
-        break
+
+      } catch (llmErr: any) {
+        if (llmErr?.name === 'AbortError') return  // barge-in — clean exit
+        logger.error('pipeline', `LLM error: ${llmErr}`, { callId: session.callId })
+        if (data.generation === myGeneration) {
+          responseText = "Could you repeat that? I did not quite catch it."
+          await speakText(callControlId, responseText, myGeneration)
+        }
       }
     }
 
@@ -650,6 +648,16 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     const current = activeSessions.get(callControlId)
     if (current && current.generation === myGeneration) {
       current.isProcessing = false
+
+      // Drain the transcript queue — if a message arrived while we were busy,
+      // process it now. Generation check inside handleProspectSpeech keeps it safe.
+      if (current.pendingTranscript) {
+        const queued = current.pendingTranscript
+        current.pendingTranscript = null
+        console.log(`[Pipeline] Processing queued transcript: "${queued}"`)
+        // Call without await so the finally block completes first
+        setImmediate(() => handleProspectSpeech(callControlId, queued))
+      }
     }
   }
 }
