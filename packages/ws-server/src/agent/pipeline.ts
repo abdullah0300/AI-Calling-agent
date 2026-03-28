@@ -495,10 +495,12 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
   const data = activeSessions.get(callControlId)
   if (!data) return
 
-  if (isBackchannelOnly(transcript)) {
-    console.log(`[Pipeline] Backchannel ignored: "${transcript}"`)
-    return
-  }
+  // Backchannel filter removed — the LLM knows the conversation history and
+  // handles short responses ("yes", "okay", "uh-huh") correctly in context.
+  // Filtering here caused "Yes." to be dropped when the prospect answered a
+  // direct yes/no question, killing the qualifying turn entirely.
+  // The STT-level backchannel filter in stt.ts remains — that one only prevents
+  // false barge-in signals, which is a different concern.
 
   // If we're already processing a turn, queue this transcript.
   // The finally block will pick it up once the current turn completes.
