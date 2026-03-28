@@ -142,6 +142,11 @@ interface ActiveSession {
   isProcessing:    boolean              // true while LLM+TTS pipeline is running
   isStarted:       boolean              // guard against double-start
   maxDurationTimer: NodeJS.Timeout | null
+  // If a transcript arrives while isProcessing is true, save it here.
+  // handleProspectSpeech picks it up in its finally block and processes it
+  // after the current turn completes. Only the most recent transcript is kept —
+  // if two arrive while processing, the older one is irrelevant.
+  pendingTranscript: string | null
 
   // ── Speculative generation (EagerEndOfTurn) ──────────────────────────────
   // When Flux fires EagerEndOfTurn, we start the LLM speculatively.
@@ -187,6 +192,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     isProcessing:         false,
     isStarted:            false,
     maxDurationTimer:     null,
+    pendingTranscript:    null,
     speculativeAbort:     null,
     speculativeTranscript: null,
     costLlm:              0,
@@ -487,13 +493,24 @@ async function runSpeculativeLLM(
 // operation drops silently and the function exits cleanly.
 async function handleProspectSpeech(callControlId: string, transcript: string) {
   const data = activeSessions.get(callControlId)
-  if (!data || data.isProcessing) return
+  if (!data) return
 
   if (isBackchannelOnly(transcript)) {
     console.log(`[Pipeline] Backchannel ignored: "${transcript}"`)
     return
   }
 
+  // If we're already processing a turn, queue this transcript.
+  // The finally block will pick it up once the current turn completes.
+  // Only the most recent transcript is kept — older ones are irrelevant.
+  if (data.isProcessing) {
+    data.pendingTranscript = transcript
+    console.log(`[Pipeline] Queued transcript (processing): "${transcript}"`)
+    return
+  }
+
+  // Clear any stale queued transcript — we are processing a fresh one
+  data.pendingTranscript = null
   data.isProcessing  = true
   const myGeneration = data.generation   // ← captured here, checked everywhere below
   const turnStart    = Date.now()
@@ -650,6 +667,16 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     const current = activeSessions.get(callControlId)
     if (current && current.generation === myGeneration) {
       current.isProcessing = false
+
+      // Drain the transcript queue — if a message arrived while we were busy,
+      // process it now. Generation check inside handleProspectSpeech keeps it safe.
+      if (current.pendingTranscript) {
+        const queued = current.pendingTranscript
+        current.pendingTranscript = null
+        console.log(`[Pipeline] Processing queued transcript: "${queued}"`)
+        // Call without await so the finally block completes first
+        setImmediate(() => handleProspectSpeech(callControlId, queued))
+      }
     }
   }
 }

@@ -29,10 +29,15 @@ export function detectScenario(transcript: string): ScenarioType {
   ]
   if (callbackPhrases.some(p => text.includes(p))) return 'callback_request'
 
+  // Only match phrases that are clearly a terminal commitment signal — NOT
+  // mid-conversation phrases. "yes", "yeah", "sounds good", "how does it work",
+  // "how much", "absolutely" are normal conversational replies that the LLM
+  // should handle. Matching them here ends the call in 6 seconds, which is
+  // exactly wrong when the prospect is simply asking a question mid-call.
   const interestedPhrases = [
-    'tell me more', 'interested', 'sounds good', 'yes', 'yeah',
-    'absolutely', 'definitely', 'how much', 'what does it cost',
-    'how does it work', 'book a meeting', 'demo', 'sounds interesting', 'go on'
+    'book a meeting', 'book me in', 'sign me up',
+    'set up a callback', 'schedule a call', 'arrange a call',
+    'let\'s do it', 'count me in', 'i\'m in',
   ]
   if (interestedPhrases.some(p => text.includes(p))) return 'interested'
 

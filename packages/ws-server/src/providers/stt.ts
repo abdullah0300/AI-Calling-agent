@@ -249,7 +249,7 @@ function createNovaStream(config: STTStreamConfig) {
     const deepgram  = createClient(config.apiKey)
     const connection = deepgram.listen.live({
       model:           model as any,
-      language:        'en-GB',
+      language:        'en',   // 'en' covers all English accents — 'en-GB' reduced accuracy for non-UK callers
       smart_format:    true,
       interim_results: true,
       vad_events:      true,
@@ -291,7 +291,13 @@ function createNovaStream(config: STTStreamConfig) {
         return
       }
 
-      if (transcript && transcript.length > 2 && (speechFinal || isFinal)) {
+      // Only fire on speech_final — not is_final.
+      // is_final fires on every finalized segment mid-utterance (e.g. after
+      // "I was wondering" before the prospect finishes speaking). speech_final
+      // fires once per full utterance after the 200ms endpointing silence.
+      // Using (speechFinal || isFinal) caused the agent to respond to partial
+      // sentences and then drop the rest of the utterance via isProcessing.
+      if (transcript && transcript.length > 2 && speechFinal) {
         if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null }
         config.onTranscript(transcript, true)
       }
