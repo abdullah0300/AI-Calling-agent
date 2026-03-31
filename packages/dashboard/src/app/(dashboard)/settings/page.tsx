@@ -95,6 +95,7 @@ const providerConfig = [
     options: [
       { value: 'anthropic', label: 'Anthropic (Claude)', note: 'Recommended · Claude Haiku 4.5' },
       { value: 'openai',    label: 'OpenAI (GPT)',       note: 'Alternative' },
+      { value: 'deepseek',  label: 'DeepSeek',           note: 'Highly capable & cost-effective' },
     ],
   },
 ]
@@ -214,6 +215,22 @@ const apiKeyGroups = [
         label: 'API Key',
         placeholder: 'sk-…',
         hint: 'Found in OpenAI Platform → API Keys',
+        isSecret: true,
+      },
+    ],
+  },
+  {
+    provider: 'DeepSeek',
+    emoji: '🐳',
+    borderColor: 'border-sky-200',
+    headerBg: 'bg-sky-50',
+    description: 'Used when LLM provider is set to DeepSeek',
+    keys: [
+      {
+        key: 'deepseek_api_key',
+        label: 'API Key',
+        placeholder: 'sk-…',
+        hint: 'Found in DeepSeek Platform → API Keys',
         isSecret: true,
       },
     ],
