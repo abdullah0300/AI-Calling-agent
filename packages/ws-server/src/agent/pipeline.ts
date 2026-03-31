@@ -454,7 +454,12 @@ async function runSpeculativeLLM(
   const { session, conversationHistory, platformSettings } = data
   const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai' | 'deepseek'
   const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : (llmProvider === 'deepseek' ? platformSettings.deepseek_api_key : platformSettings.anthropic_api_key)
-  const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
+  let llmModel      = session.agent.active_llm_model || platformSettings.active_llm_model
+
+  // Auto-correct mismatched default models if provider is changed
+  if (llmProvider === 'deepseek' && !llmModel.includes('deepseek')) llmModel = 'deepseek-chat'
+  if (llmProvider === 'anthropic' && !llmModel.includes('claude'))  llmModel = 'claude-haiku-4-5'
+  if (llmProvider === 'openai' && !llmModel.includes('gpt'))        llmModel = 'gpt-4o-mini'
 
   const sentences: string[] = []
   let fullText = ''
@@ -556,8 +561,12 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     // was the root cause of the agent ignoring what the prospect actually said.
     {
       const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai' | 'deepseek'
-      const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
+      let llmModel      = session.agent.active_llm_model || platformSettings.active_llm_model
       const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : (llmProvider === 'deepseek' ? platformSettings.deepseek_api_key : platformSettings.anthropic_api_key)
+
+      if (llmProvider === 'deepseek' && !llmModel.includes('deepseek')) llmModel = 'deepseek-chat'
+      if (llmProvider === 'anthropic' && !llmModel.includes('claude'))  llmModel = 'claude-haiku-4-5'
+      if (llmProvider === 'openai' && !llmModel.includes('gpt'))        llmModel = 'gpt-4o-mini'
 
       // Check if a speculative result is ready from EagerEndOfTurn
       const speculativeKey    = `${callControlId}:${myGeneration}`

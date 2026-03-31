@@ -14,7 +14,7 @@ const agentSchema = z.object({
   greeting_message: z.string().default(''),
   not_interested_message: z.string().default(''),
   max_call_duration_seconds: z.number().int().min(30).max(600).default(180),
-  active_llm: z.enum(['anthropic', 'openai']).default('anthropic'),
+  active_llm: z.enum(['anthropic', 'openai', 'deepseek']).default('anthropic'),
   active_llm_model: z.string().default('claude-haiku-4-5'),
   active_tts: z.enum(['elevenlabs', 'deepgram', 'google', 'cartesia']).default('deepgram'),
   active_stt: z.enum(['deepgram', 'google']).default('deepgram'),

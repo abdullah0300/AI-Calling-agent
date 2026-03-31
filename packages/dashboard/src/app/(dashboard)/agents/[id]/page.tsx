@@ -323,13 +323,14 @@ If silence for a few seconds: "Hello, are you still there?"`}
                 <SelectContent>
                   <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
                   <SelectItem value="openai">OpenAI (GPT)</SelectItem>
+                  <SelectItem value="deepseek">DeepSeek</SelectItem>
                 </SelectContent>
               </Select>
             </FieldGroup>
 
             <FieldGroup
               label="LLM Model"
-              hint="Exact model ID (e.g. claude-haiku-4-5, gpt-4o-mini)."
+              hint="Exact model ID (e.g. claude-haiku-4-5, gpt-4o-mini, deepseek-chat)."
               icon={<Cpu className="h-3.5 w-3.5 text-slate-400" />}
             >
               <Input

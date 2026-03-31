@@ -14,7 +14,7 @@ const agentUpdateSchema = z.object({
   greeting_message: z.string().optional(),
   not_interested_message: z.string().optional(),
   max_call_duration_seconds: z.number().int().min(30).max(600).optional(),
-  active_llm: z.enum(['anthropic', 'openai']).optional(),
+  active_llm: z.enum(['anthropic', 'openai', 'deepseek']).optional(),
   active_llm_model: z.string().optional(),
   active_tts: z.enum(['elevenlabs', 'deepgram', 'google', 'cartesia']).optional(),
   active_stt: z.enum(['deepgram', 'google']).optional(),
