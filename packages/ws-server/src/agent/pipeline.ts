@@ -452,8 +452,8 @@ async function runSpeculativeLLM(
   if (!data?.platformSettings) return
 
   const { session, conversationHistory, platformSettings } = data
-  const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
-  const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : platformSettings.anthropic_api_key
+  const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai' | 'deepseek'
+  const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : (llmProvider === 'deepseek' ? platformSettings.deepseek_api_key : platformSettings.anthropic_api_key)
   const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
 
   const sentences: string[] = []
@@ -555,9 +555,9 @@ async function handleProspectSpeech(callControlId: string, transcript: string) {
     // all handled by the LLM. Keyword matching cannot understand context and
     // was the root cause of the agent ignoring what the prospect actually said.
     {
-      const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai'
+      const llmProvider = (session.agent.active_llm || platformSettings.active_llm) as 'anthropic' | 'openai' | 'deepseek'
       const llmModel    = session.agent.active_llm_model || platformSettings.active_llm_model
-      const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : platformSettings.anthropic_api_key
+      const llmApiKey   = llmProvider === 'openai' ? platformSettings.openai_api_key : (llmProvider === 'deepseek' ? platformSettings.deepseek_api_key : platformSettings.anthropic_api_key)
 
       // Check if a speculative result is ready from EagerEndOfTurn
       const speculativeKey    = `${callControlId}:${myGeneration}`

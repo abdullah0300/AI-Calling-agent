@@ -11,6 +11,7 @@ export interface PlatformSettings {
   // API keys — stored in settings table, managed via the Settings page
   anthropic_api_key: string
   openai_api_key: string
+  deepseek_api_key: string
   deepgram_api_key: string
   elevenlabs_api_key: string
   elevenlabs_voice_id: string
@@ -46,6 +47,7 @@ export async function loadSettings(): Promise<PlatformSettings> {
     active_telephony:     map.active_telephony     || 'telnyx',
     anthropic_api_key:    map.anthropic_api_key    || process.env.ANTHROPIC_API_KEY    || '',
     openai_api_key:       map.openai_api_key       || process.env.OPENAI_API_KEY       || '',
+    deepseek_api_key:     map.deepseek_api_key     || process.env.DEEPSEEK_API_KEY     || '',
     deepgram_api_key:     map.deepgram_api_key     || process.env.DEEPGRAM_API_KEY     || '',
     elevenlabs_api_key:   map.elevenlabs_api_key   || process.env.ELEVENLABS_API_KEY   || '',
     elevenlabs_voice_id:  map.elevenlabs_voice_id  || process.env.ELEVENLABS_VOICE_ID  || '21m00Tcm4TlvDq8ikWAM',

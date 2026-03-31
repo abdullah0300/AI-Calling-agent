@@ -17,7 +17,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
 
 export interface LLMConfig {
-  provider: 'anthropic' | 'openai'
+  provider: 'anthropic' | 'openai' | 'deepseek'
   apiKey: string
   model: string
   systemPrompt: string
@@ -35,6 +35,8 @@ const ANTHROPIC_INPUT_PER_TOKEN  = 1.00 / 1_000_000   // $1.00 / 1M input  (Haik
 const ANTHROPIC_OUTPUT_PER_TOKEN = 5.00 / 1_000_000   // $5.00 / 1M output (Haiku 4.5)
 const OPENAI_INPUT_PER_TOKEN     = 0.15 / 1_000_000   // $0.15 / 1M input  (GPT-4o-mini)
 const OPENAI_OUTPUT_PER_TOKEN    = 0.60 / 1_000_000   // $0.60 / 1M output (GPT-4o-mini)
+const DEEPSEEK_INPUT_PER_TOKEN   = 0.14 / 1_000_000   // $0.14 / 1M input  (DeepSeek V3)
+const DEEPSEEK_OUTPUT_PER_TOKEN  = 0.28 / 1_000_000   // $0.28 / 1M output (DeepSeek V3)
 
 export interface LLMStreamConfig extends LLMConfig {
   // Called with each complete sentence as the LLM streams.
@@ -144,8 +146,12 @@ export async function streamAgentResponse(config: LLMStreamConfig): Promise<LLMR
     return { text: fullText, costUsd }
   }
 
-  // ── OpenAI streaming ────────────────────────────────────────────────────────
-  const client = new OpenAI({ apiKey: config.apiKey })
+  // ── OpenAI & DeepSeek streaming ─────────────────────────────────────────────
+  const isDeepSeek = config.provider === 'deepseek'
+  const client = new OpenAI({ 
+    apiKey: config.apiKey,
+    baseURL: isDeepSeek ? 'https://api.deepseek.com' : undefined
+  })
   const stream = await client.chat.completions.create(
     {
       model:          config.model,
@@ -197,7 +203,9 @@ export async function streamAgentResponse(config: LLMStreamConfig): Promise<LLMR
     await config.onSentence(trailing)
   }
 
-  const costUsd = (inputTokens * OPENAI_INPUT_PER_TOKEN) + (outputTokens * OPENAI_OUTPUT_PER_TOKEN)
+  const costUsd = isDeepSeek 
+    ? (inputTokens * DEEPSEEK_INPUT_PER_TOKEN) + (outputTokens * DEEPSEEK_OUTPUT_PER_TOKEN)
+    : (inputTokens * OPENAI_INPUT_PER_TOKEN) + (outputTokens * OPENAI_OUTPUT_PER_TOKEN)
   return { text: fullText, costUsd }
 }
 
@@ -222,7 +230,11 @@ export async function generateAgentResponse(config: LLMConfig): Promise<LLMResul
     return { text, costUsd: (inputTokens * ANTHROPIC_INPUT_PER_TOKEN) + (outputTokens * ANTHROPIC_OUTPUT_PER_TOKEN) }
   }
 
-  const client   = new OpenAI({ apiKey: config.apiKey })
+  const isDeepSeek = config.provider === 'deepseek'
+  const client     = new OpenAI({ 
+    apiKey: config.apiKey,
+    baseURL: isDeepSeek ? 'https://api.deepseek.com' : undefined
+  })
   const response = await client.chat.completions.create({
     model:      config.model,
     max_tokens: 160,
@@ -235,5 +247,8 @@ export async function generateAgentResponse(config: LLMConfig): Promise<LLMResul
   const text         = response.choices[0]?.message?.content || ''
   const inputTokens  = response.usage?.prompt_tokens     || 0
   const outputTokens = response.usage?.completion_tokens || 0
-  return { text, costUsd: (inputTokens * OPENAI_INPUT_PER_TOKEN) + (outputTokens * OPENAI_OUTPUT_PER_TOKEN) }
+  const costUsd      = isDeepSeek
+    ? (inputTokens * DEEPSEEK_INPUT_PER_TOKEN) + (outputTokens * DEEPSEEK_OUTPUT_PER_TOKEN)
+    : (inputTokens * OPENAI_INPUT_PER_TOKEN) + (outputTokens * OPENAI_OUTPUT_PER_TOKEN)
+  return { text, costUsd }
 }
