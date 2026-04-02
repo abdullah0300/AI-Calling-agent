@@ -11,7 +11,7 @@ import { supabase } from '../db/client'
 export type LogLevel = 'info' | 'warn' | 'error'
 export type LogSource =
   | 'pipeline' | 'dialer' | 'stt' | 'tts'
-  | 'recording' | 'webhook' | 'server' | 'noise'
+  | 'recording' | 'webhook' | 'server' | 'noise' | 'cartesia-line'
 
 interface LogContext {
   callId?:    string
