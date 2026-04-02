@@ -19,6 +19,8 @@ const agentSchema = z.object({
   active_tts: z.enum(['elevenlabs', 'deepgram', 'google', 'cartesia']).default('deepgram'),
   active_stt: z.enum(['deepgram', 'google']).default('deepgram'),
   active_telephony: z.enum(['telnyx', 'twilio']).default('telnyx'),
+  pipeline_type: z.enum(['native', 'cartesia_line']).default('native'),
+  cartesia_agent_id: z.string().optional().nullable(),
 })
 
 export async function GET() {

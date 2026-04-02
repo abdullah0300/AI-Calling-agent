@@ -22,6 +22,8 @@ import { createSTTStream }          from '../providers/stt'
 import { streamTextToSpeech }       from '../providers/tts'
 import { streamAgentResponse }      from '../providers/llm'
 import { detectScenario, buildSystemPrompt } from './scenarios'
+import { createCartesiaLineSession } from '../providers/cartesia-line'
+import type { CartesiaLineSession }  from '../providers/cartesia-line'
 import { supabase }                 from '../db/client'
 import { loadSettings }             from '../db/settings'
 import {
@@ -163,6 +165,11 @@ interface ActiveSession {
 
   // ── Noise suppression ────────────────────────────────────────────────────
   denoisingSessionId: string         // per-call RNNoise state handle
+
+  // ── Cartesia Line (pipeline_type === 'cartesia_line' only) ───────────────
+  // Non-null when the agent delegates STT+LLM+TTS to Cartesia Line.
+  // When set, handleAudioChunk routes audio here instead of the STT stream.
+  cartesiaLineSession: CartesiaLineSession | null
 }
 
 export const activeSessions = new Map<string, ActiveSession>()
@@ -195,6 +202,7 @@ export function registerSession(callControlId: string, session: CallSession) {
     pendingTranscript:    null,
     speculativeAbort:     null,
     speculativeTranscript: null,
+    cartesiaLineSession:  null,
     costLlm:              0,
     costTts:              0,
     sttAudioBytes:        0,
@@ -322,6 +330,51 @@ export async function startSession(callControlId: string) {
   await initNoiseSuppression()
   createNoiseSuppressionState(data.denoisingSessionId)
 
+  // ── Cartesia Line branch ─────────────────────────────────────────────────
+  // When pipeline_type === 'cartesia_line', delegate STT+LLM+TTS to Cartesia.
+  // Audio routing in handleAudioChunk detects cartesiaLineSession and skips
+  // the native STT path entirely. Everything else (endSession, DB writes,
+  // cost webhooks, dialer) is untouched.
+  if (session.agent.pipeline_type === 'cartesia_line') {
+    if (!session.agent.cartesia_agent_id) {
+      logger.error('pipeline', 'Cartesia Line selected but cartesia_agent_id is not set', { callId: session.callId })
+      await endSession(callControlId, 'error')
+      return
+    }
+    if (!platformSettings.cartesia_api_key) {
+      logger.error('pipeline', 'Cartesia Line selected but cartesia_api_key is not configured in Settings', { callId: session.callId })
+      await endSession(callControlId, 'error')
+      return
+    }
+
+    data.cartesiaLineSession = createCartesiaLineSession({
+      apiKey:   platformSettings.cartesia_api_key,
+      agentId:  session.agent.cartesia_agent_id,
+      callId:   session.callId,
+
+      onAudioChunk: (base64Mp3) => {
+        const current = activeSessions.get(callControlId)
+        if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) return
+        current.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Mp3 } }))
+      },
+
+      onTranscript: (role, text) => {
+        const current = activeSessions.get(callControlId)
+        if (!current) return
+        current.session.transcript.push({ role, text, timestamp: new Date().toISOString() })
+        console.log(`[CartesiaLine] ${role}: "${text}"`)
+      },
+
+      onCallEnded: () => {
+        endSession(callControlId, 'completed')
+          .catch(err => logger.error('pipeline', `CartesiaLine onCallEnded error: ${err}`, { callId: session.callId }))
+      },
+    })
+
+    console.log(`[Pipeline] Cartesia Line session started: ${callControlId}`)
+    return  // ← native STT/LLM/TTS path is skipped entirely
+  }
+
   // Provider selection: agent-level setting overrides global platform setting
   const sttProvider = (session.agent.active_stt || platformSettings.active_stt) as 'deepgram' | 'google'
   const sttModel    = session.agent.active_stt_model || platformSettings.active_stt_model
@@ -413,7 +466,16 @@ export async function startSession(callControlId: string) {
 // All downstream modules receive linear16 PCM and never touch mulaw.
 export async function handleAudioChunk(callControlId: string, audioBuffer: Buffer) {
   const data = activeSessions.get(callControlId)
-  if (!data?.sttStream) return
+  if (!data) return
+
+  // ── Cartesia Line path: forward PCM directly to Cartesia's WebSocket ──────
+  if (data.cartesiaLineSession) {
+    const pcm = mulawToLinear16(audioBuffer)
+    data.cartesiaLineSession.sendAudio(pcm)
+    return
+  }
+
+  if (!data.sttStream) return
 
   // 1. Convert mulaw → linear16 PCM (single conversion for the entire pipeline)
   const pcm = mulawToLinear16(audioBuffer)
@@ -809,9 +871,10 @@ export async function endSession(callControlId: string, outcome: string) {
       .catch(err => logger.error('recording', `stopRecording error: ${String(err)}`, { callId: session?.callId }))
   }
 
-  if (maxDurationTimer)      clearTimeout(maxDurationTimer)
-  if (data.falseBargeInTimer) clearTimeout(data.falseBargeInTimer)
-  if (sttStream)              sttStream.close()
+  if (maxDurationTimer)          clearTimeout(maxDurationTimer)
+  if (data.falseBargeInTimer)    clearTimeout(data.falseBargeInTimer)
+  if (sttStream)                 sttStream.close()
+  if (data.cartesiaLineSession)  data.cartesiaLineSession.close()
   destroyNoiseSuppressionState(data.denoisingSessionId)
 
   const durationSeconds = Math.floor(

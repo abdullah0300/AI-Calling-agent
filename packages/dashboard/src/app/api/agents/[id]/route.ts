@@ -19,6 +19,8 @@ const agentUpdateSchema = z.object({
   active_tts: z.enum(['elevenlabs', 'deepgram', 'google', 'cartesia']).optional(),
   active_stt: z.enum(['deepgram', 'google']).optional(),
   active_telephony: z.enum(['telnyx', 'twilio']).optional(),
+  pipeline_type: z.enum(['native', 'cartesia_line']).optional(),
+  cartesia_agent_id: z.string().optional().nullable(),
 })
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {

@@ -37,6 +37,9 @@ export interface Agent {
   active_stt: STTProvider
   active_stt_model: string | null  // null = use global setting from settings table
   active_telephony: TelephonyProvider
+  // Migration 011 — Cartesia Line parallel pipeline
+  pipeline_type: 'native' | 'cartesia_line'
+  cartesia_agent_id: string | null  // required when pipeline_type === 'cartesia_line'
   created_at: string
   updated_at: string
 }

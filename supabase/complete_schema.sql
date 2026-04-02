@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS agents (
   active_telephony            text        NOT NULL DEFAULT 'telnyx',
   -- Migration 005: per-agent STT model override (NULL = use global setting)
   active_stt_model            text,
+  -- Migration 011: Cartesia Line parallel pipeline
+  -- 'native' = your own STT→LLM→TTS; 'cartesia_line' = delegate to Cartesia Line
+  pipeline_type               text        NOT NULL DEFAULT 'native'
+                              CHECK (pipeline_type IN ('native', 'cartesia_line')),
+  cartesia_agent_id           text,
   created_at                  timestamptz NOT NULL DEFAULT now(),
   updated_at                  timestamptz NOT NULL DEFAULT now()
 );
