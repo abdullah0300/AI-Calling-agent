@@ -10,7 +10,7 @@ const supabase = createClient(
 const agentUpdateSchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().optional().nullable(),
-  system_prompt: z.string().min(1).optional(),
+  system_prompt: z.string().optional(),
   greeting_message: z.string().optional(),
   not_interested_message: z.string().optional(),
   max_call_duration_seconds: z.number().int().min(30).max(600).optional(),

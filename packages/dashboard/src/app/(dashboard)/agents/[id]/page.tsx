@@ -128,7 +128,8 @@ export default function AgentEditPage() {
     }
   }
 
-  const maxDuration = agent.max_call_duration_seconds || 180
+  const maxDuration      = agent.max_call_duration_seconds || 180
+  const isCartesiaLine   = agent.pipeline_type === 'cartesia_line'
 
   if (loading) {
     return (
@@ -206,9 +207,96 @@ export default function AgentEditPage() {
           </FieldGroup>
         </Section>
 
-        {/* ── Section 2: System Prompt ── */}
+        {/* ── Section 2: Pipeline ── */}
         <Section
           number={2}
+          title="Conversation Pipeline"
+          subtitle="Choose how this agent handles STT, LLM, and TTS"
+          icon={<Zap className="h-4 w-4 text-blue-600" />}
+        >
+          <div className="grid sm:grid-cols-2 gap-4">
+            <button
+              type="button"
+              onClick={() => handleChange('pipeline_type', 'native')}
+              className={`text-left rounded-xl border-2 p-4 transition-colors ${
+                !isCartesiaLine
+                  ? 'border-blue-500 bg-blue-50'
+                  : 'border-slate-200 bg-white hover:border-slate-300'
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <Cpu className="h-4 w-4 text-slate-600 shrink-0" />
+                <span className="font-semibold text-slate-900 text-sm">Native Pipeline</span>
+                {!isCartesiaLine && <CheckCircle className="h-4 w-4 text-blue-500 ml-auto" />}
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Your own STT → LLM → TTS chain. Full control over every provider,
+                barge-in, speculative generation, and cost tracking.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {['Deepgram STT', 'Claude / GPT', 'ElevenLabs TTS', 'Barge-in'].map(t => (
+                  <span key={t} className="text-[10px] bg-slate-100 text-slate-600 rounded-full px-2 py-0.5">{t}</span>
+                ))}
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleChange('pipeline_type', 'cartesia_line')}
+              className={`text-left rounded-xl border-2 p-4 transition-colors ${
+                isCartesiaLine
+                  ? 'border-orange-400 bg-orange-50'
+                  : 'border-slate-200 bg-white hover:border-slate-300'
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <Zap className="h-4 w-4 text-orange-500 shrink-0" />
+                <span className="font-semibold text-slate-900 text-sm">Cartesia Line</span>
+                {isCartesiaLine && <CheckCircle className="h-4 w-4 text-orange-500 ml-auto" />}
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Delegates the full conversation to your Cartesia Line agent.
+                Script, voice, and prompt are already configured on Cartesia's platform.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {['Ink STT', 'Cartesia LLM', 'Sonic-3 voice', 'Hosted by Cartesia'].map(t => (
+                  <span key={t} className="text-[10px] bg-orange-100 text-orange-700 rounded-full px-2 py-0.5">{t}</span>
+                ))}
+              </div>
+            </button>
+          </div>
+
+          {isCartesiaLine && (
+            <div className="mt-2 space-y-4">
+              <div className="bg-orange-50 border border-orange-100 rounded-xl p-4 flex gap-3">
+                <Info className="h-4 w-4 text-orange-500 shrink-0 mt-0.5" />
+                <p className="text-xs text-orange-700 leading-relaxed">
+                  Your agent's script, voice, and instructions are already configured on Cartesia's platform.
+                  All you need here is the <strong>Agent ID</strong> from your Cartesia dashboard,
+                  and your <strong>Cartesia API Key</strong> saved in Settings.
+                  Leads, campaigns, and call tracking work exactly as normal.
+                </p>
+              </div>
+              <FieldGroup
+                label="Cartesia Agent ID"
+                required
+                hint="Found in your Cartesia dashboard — the agent you built there. Looks like a UUID."
+                icon={<Zap className="h-3.5 w-3.5 text-orange-500" />}
+              >
+                <Input
+                  value={agent.cartesia_agent_id || ''}
+                  onChange={e => handleChange('cartesia_agent_id', e.target.value)}
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  className="bg-slate-50 font-mono text-sm"
+                />
+              </FieldGroup>
+            </div>
+          )}
+        </Section>
+
+        {/* ── Section 3: System Prompt (native only) ── */}
+        {!isCartesiaLine && <Section
+          number={3}
           title="System Prompt"
           subtitle="Full instructions for the agent — write it exactly as you want the LLM to receive it"
           icon={<Bot className="h-4 w-4 text-blue-600" />}
@@ -259,11 +347,11 @@ If silence for a few seconds: "Hello, are you still there?"`}
               className="bg-slate-50 resize-y text-sm font-mono"
             />
           </div>
-        </Section>
+        </Section>}
 
-        {/* ── Section 3: Instant Scripts ── */}
-        <Section
-          number={3}
+        {/* ── Section 4: Instant Scripts (native only) ── */}
+        {!isCartesiaLine && <Section
+          number={4}
           title="Instant Scripts"
           subtitle="Two hard-coded messages that bypass the LLM entirely — spoken with zero latency"
           icon={<MessageSquare className="h-4 w-4 text-blue-600" />}
@@ -301,16 +389,21 @@ If silence for a few seconds: "Hello, are you still there?"`}
               <p className="text-xs text-slate-400">{hint}</p>
             </div>
           ))}
-        </Section>
+        </Section>}
 
-        {/* ── Section 4: Technology Stack ── */}
+        {/* ── Section 5: Technology Stack ── */}
+        {/* For Cartesia Line: only telephony + max duration are relevant */}
         <Section
-          number={4}
-          title="Technology Stack"
-          subtitle="AI providers and call configuration for this agent"
+          number={isCartesiaLine ? 3 : 5}
+          title="Call Configuration"
+          subtitle={isCartesiaLine
+            ? 'Telephony provider and max call duration'
+            : 'AI providers and call configuration for this agent'}
           icon={<Cpu className="h-4 w-4 text-blue-600" />}
         >
           <div className="grid sm:grid-cols-2 gap-5">
+            {/* LLM / STT / TTS — native pipeline only */}
+            {!isCartesiaLine && <>
             <FieldGroup
               label="LLM Provider"
               hint="AI brain that generates the agent's responses."
@@ -405,6 +498,7 @@ If silence for a few seconds: "Hello, are you still there?"`}
                 </SelectContent>
               </Select>
             </FieldGroup>
+            </>}
 
             <FieldGroup
               label="Telephony Provider"
@@ -450,99 +544,6 @@ If silence for a few seconds: "Hello, are you still there?"`}
               </div>
             </FieldGroup>
           </div>
-        </Section>
-
-        {/* ── Section 5: Pipeline ── */}
-        <Section
-          number={5}
-          title="Conversation Pipeline"
-          subtitle="Choose how this agent handles STT, LLM, and TTS"
-          icon={<Zap className="h-4 w-4 text-blue-600" />}
-        >
-          <div className="grid sm:grid-cols-2 gap-4">
-            {/* Native option */}
-            <button
-              type="button"
-              onClick={() => handleChange('pipeline_type', 'native')}
-              className={`text-left rounded-xl border-2 p-4 transition-colors ${
-                (agent.pipeline_type || 'native') === 'native'
-                  ? 'border-blue-500 bg-blue-50'
-                  : 'border-slate-200 bg-white hover:border-slate-300'
-              }`}
-            >
-              <div className="flex items-center gap-2 mb-2">
-                <Cpu className="h-4 w-4 text-slate-600 shrink-0" />
-                <span className="font-semibold text-slate-900 text-sm">Native Pipeline</span>
-                {(agent.pipeline_type || 'native') === 'native' && (
-                  <CheckCircle className="h-4 w-4 text-blue-500 ml-auto" />
-                )}
-              </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                Your own STT → LLM → TTS chain. Full control over every provider,
-                barge-in, speculative generation, and cost tracking.
-              </p>
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {['Deepgram STT', 'Claude / GPT', 'ElevenLabs TTS', 'Barge-in'].map(t => (
-                  <span key={t} className="text-[10px] bg-slate-100 text-slate-600 rounded-full px-2 py-0.5">{t}</span>
-                ))}
-              </div>
-            </button>
-
-            {/* Cartesia Line option */}
-            <button
-              type="button"
-              onClick={() => handleChange('pipeline_type', 'cartesia_line')}
-              className={`text-left rounded-xl border-2 p-4 transition-colors ${
-                agent.pipeline_type === 'cartesia_line'
-                  ? 'border-orange-400 bg-orange-50'
-                  : 'border-slate-200 bg-white hover:border-slate-300'
-              }`}
-            >
-              <div className="flex items-center gap-2 mb-2">
-                <Zap className="h-4 w-4 text-orange-500 shrink-0" />
-                <span className="font-semibold text-slate-900 text-sm">Cartesia Line</span>
-                {agent.pipeline_type === 'cartesia_line' && (
-                  <CheckCircle className="h-4 w-4 text-orange-500 ml-auto" />
-                )}
-              </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                Delegates the full conversation to your Cartesia Line agent.
-                Cartesia handles STT, LLM, and TTS internally with Sonic-3 voice.
-              </p>
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {['Ink STT', 'Cartesia LLM', 'Sonic-3 TTS', 'Hosted by Cartesia'].map(t => (
-                  <span key={t} className="text-[10px] bg-orange-100 text-orange-700 rounded-full px-2 py-0.5">{t}</span>
-                ))}
-              </div>
-            </button>
-          </div>
-
-          {/* Cartesia Agent ID — only shown when Cartesia Line is selected */}
-          {agent.pipeline_type === 'cartesia_line' && (
-            <div className="mt-2">
-              <div className="bg-orange-50 border border-orange-100 rounded-xl p-4 flex gap-3 mb-4">
-                <Info className="h-4 w-4 text-orange-500 shrink-0 mt-0.5" />
-                <p className="text-xs text-orange-700 leading-relaxed">
-                  Your Telnyx number, leads, campaigns, and all call tracking work exactly as normal.
-                  Only the conversation brain changes — Cartesia handles STT, LLM, and TTS.
-                  Make sure your <strong>Cartesia API Key</strong> is saved in Settings.
-                </p>
-              </div>
-              <FieldGroup
-                label="Cartesia Agent ID"
-                required
-                hint="Found in your Cartesia platform dashboard — the agent you built there. Looks like: ag_xxxxxxxxxxxxxxxx"
-                icon={<Zap className="h-3.5 w-3.5 text-orange-500" />}
-              >
-                <Input
-                  value={agent.cartesia_agent_id || ''}
-                  onChange={e => handleChange('cartesia_agent_id', e.target.value)}
-                  placeholder="ag_xxxxxxxxxxxxxxxx"
-                  className="bg-slate-50 font-mono text-sm"
-                />
-              </FieldGroup>
-            </div>
-          )}
         </Section>
 
         {/* ── Status messages ── */}

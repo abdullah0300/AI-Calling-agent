@@ -352,17 +352,19 @@ export async function startSession(callControlId: string) {
       agentId:  session.agent.cartesia_agent_id,
       callId:   session.callId,
 
-      onAudioChunk: (base64Mp3) => {
+      // Forward Cartesia's audio output directly to Telnyx
+      onAudioChunk: (base64Audio) => {
         const current = activeSessions.get(callControlId)
         if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) return
-        current.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Mp3 } }))
+        current.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
       },
 
-      onTranscript: (role, text) => {
+      // Agent was interrupted — clear Telnyx's audio buffer
+      onClear: () => {
         const current = activeSessions.get(callControlId)
-        if (!current) return
-        current.session.transcript.push({ role, text, timestamp: new Date().toISOString() })
-        console.log(`[CartesiaLine] ${role}: "${text}"`)
+        if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) return
+        current.ws.send(JSON.stringify({ event: 'clear', stream_id: current.telnyxStreamId }))
+        console.log(`[CartesiaLine] Telnyx buffer cleared`)
       },
 
       onCallEnded: () => {
@@ -468,10 +470,10 @@ export async function handleAudioChunk(callControlId: string, audioBuffer: Buffe
   const data = activeSessions.get(callControlId)
   if (!data) return
 
-  // ── Cartesia Line path: forward PCM directly to Cartesia's WebSocket ──────
+  // ── Cartesia Line path: forward raw mulaw directly — no conversion needed ──
+  // Cartesia accepts mulaw_8000 natively (declared in the `start` event).
   if (data.cartesiaLineSession) {
-    const pcm = mulawToLinear16(audioBuffer)
-    data.cartesiaLineSession.sendAudio(pcm)
+    data.cartesiaLineSession.sendAudio(audioBuffer)
     return
   }
 

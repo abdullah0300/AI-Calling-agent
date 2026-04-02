@@ -10,7 +10,8 @@ const supabase = createClient(
 const agentSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
-  system_prompt: z.string().min(1),
+  // Optional for cartesia_line agents — their prompt lives on Cartesia's platform
+  system_prompt: z.string().default(''),
   greeting_message: z.string().default(''),
   not_interested_message: z.string().default(''),
   max_call_duration_seconds: z.number().int().min(30).max(600).default(180),
