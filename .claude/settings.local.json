@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.cartesia.ai)",
+      "WebFetch(domain:play.cartesia.ai)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}
