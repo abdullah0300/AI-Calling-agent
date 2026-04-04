@@ -18,6 +18,7 @@
 //   This single pattern eliminates the race condition where an old LLM stream
 //   speaks sentences into the new turn after bargedIn was reset to false.
 
+import lamejs                        from '@breezystack/lamejs'
 import { createSTTStream }          from '../providers/stt'
 import { streamTextToSpeech }       from '../providers/tts'
 import { streamAgentResponse }      from '../providers/llm'
@@ -351,19 +352,49 @@ export async function startSession(callControlId: string) {
       return
     }
 
+    // MP3 encoder for Cartesia audio output.
+    // Telnyx mp3 bidirectional mode expects base64-encoded MP3 back.
+    // Cartesia outputs mulaw_8000 (mirrors input_format) — must transcode.
+    // lamejs encodes in frames of 576 samples (72ms at 8kHz) so we buffer
+    // PCM until we have enough for a complete frame before sending.
+    const mp3Encoder  = new lamejs.Mp3Encoder(1, 8000, 32)   // mono, 8kHz, 32kbps
+    let   pcmCarBuf   = new Int16Array(0)                     // pending PCM samples
+
     data.cartesiaLineSession = createCartesiaLineSession({
       apiKey:   platformSettings.cartesia_api_key,
       agentId:  session.agent.cartesia_agent_id,
       callId:   session.callId,
 
-      // Forward Cartesia's mulaw_8000 audio output directly to Telnyx
+      // Receive mulaw_8000 from Cartesia → transcode to MP3 → send to Telnyx
       onAudioChunk: (base64Audio) => {
         const current = activeSessions.get(callControlId)
         if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) {
           logger.warn('pipeline', `[CartesiaLine] onAudioChunk — Telnyx WS not open | callId: ${session.callId}`)
           return
         }
-        current.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
+
+        // 1. Decode base64 → mulaw bytes → 16-bit PCM
+        const mulawBytes = Buffer.from(base64Audio, 'base64')
+        const pcmBytes   = mulawToLinear16(mulawBytes)
+        const newSamples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2)
+
+        // 2. Append to pending PCM buffer
+        const merged = new Int16Array(pcmCarBuf.length + newSamples.length)
+        merged.set(pcmCarBuf)
+        merged.set(newSamples, pcmCarBuf.length)
+        pcmCarBuf = merged
+
+        // 3. Encode complete 576-sample MP3 frames and send each to Telnyx
+        const FRAME = 576  // lamejs mono frame size (72ms @ 8kHz)
+        while (pcmCarBuf.length >= FRAME) {
+          const frame   = pcmCarBuf.slice(0, FRAME)
+          pcmCarBuf     = pcmCarBuf.slice(FRAME)
+          const mp3Data = mp3Encoder.encodeBuffer(frame)
+          if (mp3Data.length > 0) {
+            const payload = Buffer.from(mp3Data).toString('base64')
+            current.ws.send(JSON.stringify({ event: 'media', media: { payload } }))
+          }
+        }
       },
 
       // Agent was interrupted — clear Telnyx's audio buffer

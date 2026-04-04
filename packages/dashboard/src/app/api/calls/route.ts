@@ -150,15 +150,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Telnyx API key and Connection ID are required. Add them in Settings.' }, { status: 500 })
     }
 
-    // Cartesia Line uses RTP/PCMU bidirectional mode — mulaw_8000 native format.
-    // Native pipeline (ElevenLabs, Deepgram TTS) uses MP3 mode.
-    const isCartesiaLine = agent.pipeline_type === 'cartesia_line'
-    const bidirectionalMode  = isCartesiaLine ? 'rtp'  : 'mp3'
-    const bidirectionalCodec = isCartesiaLine ? 'PCMU' : undefined
+    console.log(`[API/calls] Placing Telnyx call — lead: ${lead.phone_number} | pipeline: ${agent.pipeline_type}`)
 
-    console.log(`[API/calls] Placing Telnyx call — lead: ${lead.phone_number} | pipeline: ${agent.pipeline_type} | bidirectional: ${bidirectionalMode}${bidirectionalCodec ? '/' + bidirectionalCodec : ''}`)
-
-    // Initiate Telnyx outbound call
+    // All pipelines use mp3 bidirectional mode on the Telnyx WebSocket.
+    // stream_bidirectional_mode: 'rtp' is only valid via TeXML <Stream> elements,
+    // not via the POST /v2/calls Call Control API — it silently prevents the WS
+    // 'start' event from firing, so startSession never runs.
+    // Cartesia Line audio (mulaw_8000) is transcoded → MP3 in pipeline.ts before
+    // being forwarded to Telnyx.
     const telnyxPayload: Record<string, unknown> = {
       connection_id:             telnyxConnectionId,
       to:                        lead.phone_number,
@@ -170,10 +169,7 @@ export async function POST(req: NextRequest) {
       // WSS URL must be publicly reachable by Telnyx — use ngrok public URL
       stream_url:                `${wsPublicUrl.replace('https://', 'wss://')}/audio`,
       stream_track:              'inbound_track',
-      // Cartesia Line: RTP+PCMU (mulaw_8000 native, no transcoding)
-      // Native pipeline: MP3 (TTS providers return MP3)
-      stream_bidirectional_mode: bidirectionalMode,
-      ...(bidirectionalCodec ? { stream_bidirectional_codec: bidirectionalCodec } : {}),
+      stream_bidirectional_mode: 'mp3',
     }
 
     const telnyxRes = await fetch('https://api.telnyx.com/v2/calls', {
