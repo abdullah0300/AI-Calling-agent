@@ -154,7 +154,14 @@ wss.on('connection', (ws: WebSocket) => {
             attachWebSocket(callControlId, ws, streamId)
             // Start session here — AFTER WebSocket is attached — so greeting audio
             // can be sent immediately. Starting from the webhook risks ws being null.
-            await startSession(callControlId)
+            try {
+              await startSession(callControlId)
+            } catch (startErr: any) {
+              // startSession failures (e.g. Supabase unreachable, missing API keys)
+              // must NOT be swallowed — they leave the call silent with no session
+              logger.error('server', `startSession failed for ${callControlId}: ${startErr?.message ?? String(startErr)}`)
+              await endSession(callControlId, 'error').catch(() => {})
+            }
           }
           break
 
@@ -179,8 +186,13 @@ wss.on('connection', (ws: WebSocket) => {
           }
           break
       }
-    } catch (e) {
-      // Non-JSON binary — ignore silently
+    } catch (e: any) {
+      // Catch genuine JSON parse errors (non-JSON binary frames from Telnyx)
+      // but do NOT catch errors thrown by startSession/endSession/handleAudioChunk —
+      // those have their own try-catch blocks and errors here indicate real failures.
+      if (!(e instanceof SyntaxError)) {
+        logger.error('server', `WS message handler error: ${e?.message ?? String(e)}`)
+      }
     }
   })
 
