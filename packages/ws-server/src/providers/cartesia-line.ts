@@ -12,8 +12,13 @@
 //   6. Transcripts are NOT streamed in real-time by Cartesia; they are fetched
 //      post-call via REST if needed
 //
-// The agent's system prompt, voice, and intro are already configured on the
-// Cartesia platform — nothing needs to be sent here except the agent ID.
+// Audio format:
+//   Input to Cartesia:  mulaw_8000 (matches Telnyx native format, no conversion)
+//   Output from Cartesia: mulaw_8000 (mirrors input format — base64 in media_output)
+//   Telnyx bidirectional: must be set to mode='rtp' + codec='PCMU' at call placement
+//
+// The agent's system prompt, voice, and intro are configured on the Cartesia
+// platform — nothing needs to be sent here except the agent ID.
 
 import WebSocket from 'ws'
 import { logger } from '../utils/logger'
@@ -21,7 +26,7 @@ import { logger } from '../utils/logger'
 export interface CartesiaLineConfig {
   apiKey:       string
   agentId:      string   // UUID from Cartesia dashboard
-  callId:       string   // your internal call UUID — for logging only
+  callId:       string   // your internal call UUID — for logging and stream_id
   onAudioChunk: (base64Audio: string) => void   // forward to Telnyx
   onClear:      () => void                      // agent interrupted — clear Telnyx buffer
   onCallEnded:  () => void                      // agent ended the call
@@ -36,7 +41,6 @@ export interface CartesiaLineSession {
 export function createCartesiaLineSession(config: CartesiaLineConfig): CartesiaLineSession {
   const { apiKey, agentId, callId, onAudioChunk, onClear, onCallEnded } = config
 
-  // Correct URL per Cartesia docs
   const wsUrl = `wss://api.cartesia.ai/agents/stream/${agentId}`
 
   let ws:       WebSocket | null = null
@@ -46,6 +50,8 @@ export function createCartesiaLineSession(config: CartesiaLineConfig): CartesiaL
 
   // Mulaw chunks that arrive before the socket is open — flushed on ack
   const audioQueue: Buffer[] = []
+
+  console.log(`[CartesiaLine] Connecting — agent: ${agentId} | call: ${callId} | url: ${wsUrl}`)
 
   ws = new WebSocket(wsUrl, {
     headers: {
@@ -58,14 +64,17 @@ export function createCartesiaLineSession(config: CartesiaLineConfig): CartesiaL
     console.log(`[CartesiaLine] WebSocket open — agent: ${agentId} | call: ${callId}`)
 
     // First message MUST be `start` with the input audio format.
-    // mulaw_8000 matches Telnyx's native format — no conversion needed.
-    // The agent's system prompt, voice, and greeting are already saved
-    // on the Cartesia platform — no overrides needed here.
-    ws!.send(JSON.stringify({
-      event:  'start',
-      config: { input_format: 'mulaw_8000' },
-    }))
-    // Ready state and queue flush happen in the `ack` handler below
+    // mulaw_8000 matches Telnyx's native RTP/PCMU format — no conversion needed.
+    // stream_id uses callId for correlation across logs.
+    // The agent's system prompt, voice, and greeting are already configured on
+    // the Cartesia platform — no overrides needed here.
+    const startMsg = {
+      event:     'start',
+      stream_id: callId,
+      config:    { input_format: 'mulaw_8000' },
+    }
+    console.log(`[CartesiaLine] Sending start event — stream_id: ${callId} | input_format: mulaw_8000`)
+    ws!.send(JSON.stringify(startMsg))
   })
 
   ws.on('message', (raw: WebSocket.RawData) => {
@@ -78,70 +87,93 @@ export function createCartesiaLineSession(config: CartesiaLineConfig): CartesiaL
 
     switch (msg.event) {
       case 'ack': {
-        // Server confirmed stream start and returned the resolved stream_id
-        streamId = msg.stream_id ?? null
+        // Server confirmed stream start — use server-assigned stream_id
+        streamId = msg.stream_id ?? callId
         ready    = true
-        console.log(`[CartesiaLine] Stream ready — stream_id: ${streamId} | call: ${callId}`)
+        console.log(`[CartesiaLine] Stream ready — stream_id: ${streamId} | call: ${callId} | queued chunks: ${audioQueue.length}`)
 
         // Flush any audio that arrived before ack
-        for (const chunk of audioQueue) {
-          sendMulawChunk(chunk)
+        if (audioQueue.length > 0) {
+          console.log(`[CartesiaLine] Flushing ${audioQueue.length} queued audio chunks`)
+          for (const chunk of audioQueue) {
+            sendMulawChunk(chunk)
+          }
+          audioQueue.length = 0
         }
-        audioQueue.length = 0
         break
       }
 
       case 'media_output': {
-        // Agent speaking — forward base64 audio to Telnyx
+        // Agent speaking — forward base64 mulaw_8000 audio to Telnyx
         const payload = msg.media?.payload
-        if (payload) onAudioChunk(payload)
+        if (payload) {
+          onAudioChunk(payload)
+        } else {
+          logger.warn('cartesia-line', `media_output event missing media.payload | call: ${callId}`)
+        }
         break
       }
 
       case 'clear': {
         // Agent was interrupted — tell Telnyx to clear buffered audio
-        console.log(`[CartesiaLine] Clear event received | call: ${callId}`)
+        console.log(`[CartesiaLine] Clear event — agent interrupted | call: ${callId}`)
         onClear()
         break
       }
 
       case 'transfer_call': {
-        // Agent requested a transfer — log it (telephony transfer not implemented)
+        // Agent requested a transfer — telephony transfer not implemented
         const target = msg.transfer?.target_phone_number ?? 'unknown'
-        logger.warn('cartesia-line', `Agent requested transfer to ${target} — not implemented`, { callId })
+        logger.warn('cartesia-line', `Agent requested transfer to ${target} — not implemented | call: ${callId}`, { callId })
         break
       }
 
       case 'error': {
         const errMsg = msg.message ?? msg.error ?? JSON.stringify(msg)
-        logger.error('cartesia-line', `Cartesia error: ${errMsg}`, { callId })
+        logger.error('cartesia-line', `Cartesia error event: ${errMsg} | call: ${callId}`, { callId, agentId })
         break
       }
 
       default:
-        // session_started, input_accepted, etc. — informational
+        // session_started, input_accepted, etc. — informational only
+        console.log(`[CartesiaLine] Event: ${msg.event} | call: ${callId}`)
         break
     }
   })
 
   ws.on('error', (err) => {
-    logger.error('cartesia-line', `WebSocket error: ${err.message}`, { callId })
+    // Network-level errors: connection refused, DNS failure, TLS error, etc.
+    logger.error('cartesia-line', `WebSocket error: ${err.message} | agent: ${agentId} | call: ${callId}`, { callId, agentId })
   })
 
   ws.on('close', (code, reason) => {
-    console.log(`[CartesiaLine] WebSocket closed — code: ${code} reason: ${reason?.toString() ?? ''} | call: ${callId}`)
+    const reasonStr = reason?.toString() ?? ''
+    console.log(`[CartesiaLine] WebSocket closed — code: ${code} | reason: "${reasonStr}" | call: ${callId}`)
+
+    // Capture closed state BEFORE setting it — so we can distinguish a natural
+    // Cartesia-initiated close (closed=false) from our own close() call (closed=true).
+    const wasClosedByUs = closed
     ready  = false
     closed = true
-    // Code 1000 = normal closure (agent ended the call naturally)
-    if (code === 1000 && !closed) {
+
+    if (code === 1000 && !wasClosedByUs) {
+      // Normal closure initiated by Cartesia: "call ended by agent"
+      console.log(`[CartesiaLine] Agent ended the call naturally — triggering endSession | call: ${callId}`)
+      onCallEnded()
+    } else if (code !== 1000 && !wasClosedByUs) {
+      // Abnormal closure — Cartesia dropped the connection unexpectedly
+      logger.error('cartesia-line', `Unexpected WebSocket close — code: ${code} | reason: "${reasonStr}" | call: ${callId}`, { callId, agentId })
+      // Still end the session so the call doesn't hang open
       onCallEnded()
     }
+    // If wasClosedByUs: close() was called from endSession — no action needed
   })
 
-  // Keepalive — Cloud Run closes idle connections after 60s without traffic.
-  // Cartesia's inactivity timeout is 180s; ping every 60s to stay alive.
+  // Keepalive — Cartesia's inactivity timeout is 180s; ping every 60s.
   const pingInterval = setInterval(() => {
-    if (ws?.readyState === WebSocket.OPEN) ws.ping()
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.ping()
+    }
   }, 60_000)
 
   // ── Internal helper ──────────────────────────────────────────────────────────
@@ -170,6 +202,7 @@ export function createCartesiaLineSession(config: CartesiaLineConfig): CartesiaL
     closed = true
     ready  = false
     clearInterval(pingInterval)
+    console.log(`[CartesiaLine] Closing session — call: ${callId}`)
     try {
       if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {
         ws.close(1000, 'call ended')
