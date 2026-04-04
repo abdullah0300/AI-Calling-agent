@@ -309,13 +309,15 @@ export async function startSession(callControlId: string) {
       .catch(err => logger.error('recording', `Failed to start recording: ${String(err)}`, { callId: session.callId }))
   }
 
-  await supabase.from('calls')
+  const { error: callUpdateErr } = await supabase.from('calls')
     .update({ status: 'in_progress', started_at: new Date().toISOString() })
     .eq('id', session.callId)
+  if (callUpdateErr) logger.error('pipeline', `Supabase: failed to set call in_progress — ${callUpdateErr.message}`, { callId: session.callId })
 
-  await supabase.from('leads')
+  const { error: leadUpdateErr } = await supabase.from('leads')
     .update({ status: 'calling' })
     .eq('id', session.leadId)
+  if (leadUpdateErr) logger.error('pipeline', `Supabase: failed to set lead calling — ${leadUpdateErr.message}`, { callId: session.callId })
 
   // Safety timer — force end after max duration to prevent runaway cost
   data.maxDurationTimer = setTimeout(
@@ -336,13 +338,15 @@ export async function startSession(callControlId: string) {
   // the native STT path entirely. Everything else (endSession, DB writes,
   // cost webhooks, dialer) is untouched.
   if (session.agent.pipeline_type === 'cartesia_line') {
+    console.log(`[Pipeline] Cartesia Line pipeline — callId: ${session.callId} | agentId: ${session.agent.cartesia_agent_id ?? 'NOT SET'}`)
+
     if (!session.agent.cartesia_agent_id) {
-      logger.error('pipeline', 'Cartesia Line selected but cartesia_agent_id is not set', { callId: session.callId })
+      logger.error('pipeline', 'Cartesia Line selected but cartesia_agent_id is not set on this agent — set it in the Agent settings page', { callId: session.callId })
       await endSession(callControlId, 'error')
       return
     }
     if (!platformSettings.cartesia_api_key) {
-      logger.error('pipeline', 'Cartesia Line selected but cartesia_api_key is not configured in Settings', { callId: session.callId })
+      logger.error('pipeline', 'Cartesia Line selected but cartesia_api_key is not configured — add it in Settings → API Keys', { callId: session.callId })
       await endSession(callControlId, 'error')
       return
     }
@@ -352,10 +356,13 @@ export async function startSession(callControlId: string) {
       agentId:  session.agent.cartesia_agent_id,
       callId:   session.callId,
 
-      // Forward Cartesia's audio output directly to Telnyx
+      // Forward Cartesia's mulaw_8000 audio output directly to Telnyx
       onAudioChunk: (base64Audio) => {
         const current = activeSessions.get(callControlId)
-        if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) return
+        if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) {
+          logger.warn('pipeline', `[CartesiaLine] onAudioChunk — Telnyx WS not open | callId: ${session.callId}`)
+          return
+        }
         current.ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }))
       },
 
@@ -364,16 +371,18 @@ export async function startSession(callControlId: string) {
         const current = activeSessions.get(callControlId)
         if (!current?.ws || current.ws.readyState !== WebSocket.OPEN) return
         current.ws.send(JSON.stringify({ event: 'clear', stream_id: current.telnyxStreamId }))
-        console.log(`[CartesiaLine] Telnyx buffer cleared`)
+        console.log(`[Pipeline] [CartesiaLine] Telnyx buffer cleared | callId: ${session.callId}`)
       },
 
+      // Cartesia closed the connection (code 1000) — end the call cleanly
       onCallEnded: () => {
+        console.log(`[Pipeline] [CartesiaLine] onCallEnded fired — ending session | callId: ${session.callId}`)
         endSession(callControlId, 'completed')
           .catch(err => logger.error('pipeline', `CartesiaLine onCallEnded error: ${err}`, { callId: session.callId }))
       },
     })
 
-    console.log(`[Pipeline] Cartesia Line session started: ${callControlId}`)
+    console.log(`[Pipeline] Cartesia Line session started — callControlId: ${callControlId} | callId: ${session.callId}`)
     return  // ← native STT/LLM/TTS path is skipped entirely
   }
 
@@ -904,7 +913,7 @@ export async function endSession(callControlId: string, outcome: string) {
     outcome === 'wrong_person'     ? 'wrong_person'    :
     outcome === 'voicemail'        ? 'voicemail'       : 'no_answer'
 
-  await Promise.all([
+  const [callFinalRes, leadFinalRes] = await Promise.all([
     supabase.from('calls').update({
       status:           'completed',
       outcome,
@@ -921,6 +930,9 @@ export async function endSession(callControlId: string, outcome: string) {
       .update({ status: leadStatus })
       .eq('id', session.leadId),
   ])
+
+  if (callFinalRes.error) logger.error('pipeline', `Supabase: failed to finalise call record — ${callFinalRes.error.message}`, { callId: session.callId })
+  if (leadFinalRes.error) logger.error('pipeline', `Supabase: failed to finalise lead status — ${leadFinalRes.error.message}`, { callId: session.callId })
 
   if (session.campaignId) {
     await scheduleRetryIfNeeded(session.leadId, session.campaignId, outcome)

@@ -158,9 +158,11 @@ async function placeCall(campaign: any, lead: any): Promise<void> {
   const wsPublicUrl = process.env.WS_PUBLIC_URL || ''
 
   if (!settings.telnyx_api_key || !settings.telnyx_connection_id) {
+    logger.error('dialer', `Missing Telnyx credentials — telnyx_api_key: ${!!settings.telnyx_api_key} | telnyx_connection_id: ${!!settings.telnyx_connection_id}`)
     throw new Error('Telnyx API key or connection ID not configured in Settings')
   }
   if (!wsPublicUrl) {
+    logger.error('dialer', 'WS_PUBLIC_URL environment variable not set — cannot place calls')
     throw new Error('WS_PUBLIC_URL environment variable not set')
   }
 
@@ -181,41 +183,60 @@ async function placeCall(campaign: any, lead: any): Promise<void> {
     .single()
 
   if (callError || !callRecord) {
+    logger.error('dialer', `Supabase call record creation failed: ${callError?.message}`, { leadId: lead.id, campaignId: campaign.id })
     throw new Error(`DB call record creation failed: ${callError?.message}`)
   }
 
+  // Cartesia Line uses RTP/PCMU bidirectional mode — mulaw_8000 native format.
+  // Native pipeline (ElevenLabs, Deepgram TTS) uses MP3 mode.
+  const isCartesiaLine     = agent.pipeline_type === 'cartesia_line'
+  const bidirectionalMode  = isCartesiaLine ? 'rtp'  : 'mp3'
+  const bidirectionalCodec = isCartesiaLine ? 'PCMU' : undefined
+
+  console.log(`[Dialer] Placing Telnyx call — lead: ${lead.phone_number} | pipeline: ${agent.pipeline_type} | bidirectional: ${bidirectionalMode}${bidirectionalCodec ? '/' + bidirectionalCodec : ''}`)
+
   // Initiate Telnyx outbound call — same payload as dashboard POST /api/calls
+  const telnyxPayload: Record<string, unknown> = {
+    connection_id:             settings.telnyx_connection_id,
+    to:                        lead.phone_number,
+    from:                      phoneNumber.number,
+    client_state:              Buffer.from(JSON.stringify({ callId: callRecord.id })).toString('base64'),
+    webhook_url:               `${wsPublicUrl}/api/webhook/telnyx`,
+    webhook_url_method:        'POST',
+    stream_url:                `${wsPublicUrl.replace('https://', 'wss://')}/audio`,
+    stream_track:              'inbound_track',
+    // Cartesia Line: RTP+PCMU (mulaw_8000 native, no transcoding)
+    // Native pipeline: MP3 (TTS providers return MP3)
+    stream_bidirectional_mode: bidirectionalMode,
+    ...(bidirectionalCodec ? { stream_bidirectional_codec: bidirectionalCodec } : {}),
+  }
+
   const telnyxRes = await fetch('https://api.telnyx.com/v2/calls', {
     method: 'POST',
     headers: {
       'Content-Type':  'application/json',
       'Authorization': `Bearer ${settings.telnyx_api_key}`,
     },
-    body: JSON.stringify({
-      connection_id:             settings.telnyx_connection_id,
-      to:                        lead.phone_number,
-      from:                      phoneNumber.number,
-      client_state:              Buffer.from(JSON.stringify({ callId: callRecord.id })).toString('base64'),
-      webhook_url:               `${wsPublicUrl}/api/webhook/telnyx`,
-      webhook_url_method:        'POST',
-      stream_url:                `${wsPublicUrl.replace('https://', 'wss://')}/audio`,
-      stream_track:              'inbound_track',
-      stream_bidirectional_mode: 'mp3',
-    }),
+    body: JSON.stringify(telnyxPayload),
   })
 
   if (!telnyxRes.ok) {
     const errBody = await telnyxRes.text()
+    logger.error('dialer', `Telnyx API ${telnyxRes.status}: ${errBody}`, { leadId: lead.id, campaignId: campaign.id, phone: lead.phone_number })
     await supabase.from('calls').update({ status: 'failed' }).eq('id', callRecord.id)
     throw new Error(`Telnyx API ${telnyxRes.status}: ${errBody}`)
   }
 
   const telnyxData    = await telnyxRes.json() as { data: { call_control_id: string } }
   const callControlId = telnyxData.data.call_control_id
+  console.log(`[Dialer] Telnyx call placed — callControlId: ${callControlId} | callId: ${callRecord.id}`)
 
-  await supabase.from('calls')
+  const { error: updateErr } = await supabase.from('calls')
     .update({ telephony_call_id: callControlId })
     .eq('id', callRecord.id)
+  if (updateErr) {
+    logger.error('dialer', `Supabase failed to save callControlId: ${updateErr.message}`, { callId: callRecord.id })
+  }
 
   // Register session directly — no HTTP round-trip needed since we're in the same process
   const session: CallSession = {

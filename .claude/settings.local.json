@@ -3,7 +3,12 @@
     "allow": [
       "WebFetch(domain:docs.cartesia.ai)",
       "WebFetch(domain:play.cartesia.ai)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(grep -r \"type Agent\\\\|interface Agent\" 'D:\\\\Webcraftio\\\\AI Calling agent\\\\.claude\\\\worktrees\\\\vibrant-cori' --include=*.ts --include=*.tsx)",
+      "WebFetch(domain:edesy.in)",
+      "WebFetch(domain:telnyx.com)",
+      "WebFetch(domain:cartesia-2650f86a.mintlify.app)",
+      "WebFetch(domain:agentskills.so)"
     ]
   }
 }

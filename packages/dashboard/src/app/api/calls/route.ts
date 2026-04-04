@@ -54,6 +54,8 @@ export async function POST(req: NextRequest) {
 
     const { leadId, agentId, phoneNumberId, overrideCallingHours } = parsed.data
 
+    console.log(`[API/calls] Fetching lead: ${leadId} | agent: ${agentId} | phone: ${phoneNumberId}`)
+
     const [leadRes, agentRes, phoneRes] = await Promise.all([
       supabase.from('leads').select('*').eq('id', leadId).single(),
       supabase.from('agents').select('*').eq('id', agentId).single(),
@@ -61,6 +63,11 @@ export async function POST(req: NextRequest) {
     ])
 
     if (leadRes.error || agentRes.error || phoneRes.error) {
+      console.error('[API/calls] Supabase fetch failed —', {
+        lead:  leadRes.error?.message,
+        agent: agentRes.error?.message,
+        phone: phoneRes.error?.message,
+      })
       return NextResponse.json({ error: 'Could not fetch data' }, { status: 404 })
     }
 
@@ -113,6 +120,7 @@ export async function POST(req: NextRequest) {
       .select().single()
 
     if (callError || !callRecord) {
+      console.error('[API/calls] Supabase call record creation failed —', callError?.message)
       return NextResponse.json({ error: 'Could not create call record' }, { status: 500 })
     }
 
@@ -120,6 +128,7 @@ export async function POST(req: NextRequest) {
     const wsPublicUrl = process.env.WS_PUBLIC_URL
 
     if (!wsServerUrl || !wsPublicUrl) {
+      console.error('[API/calls] Missing env vars — WS_SERVER_URL:', !!wsServerUrl, '| WS_PUBLIC_URL:', !!wsPublicUrl)
       return NextResponse.json(
         { error: 'WS_SERVER_URL and WS_PUBLIC_URL environment variables must be set.' },
         { status: 500 }
@@ -137,42 +146,60 @@ export async function POST(req: NextRequest) {
     const telnyxConnectionId = settingsMap.telnyx_connection_id || process.env.TELNYX_CONNECTION_ID || ''
 
     if (!telnyxApiKey || !telnyxConnectionId) {
+      console.error('[API/calls] Missing Telnyx credentials — telnyxApiKey:', !!telnyxApiKey, '| telnyxConnectionId:', !!telnyxConnectionId)
       return NextResponse.json({ error: 'Telnyx API key and Connection ID are required. Add them in Settings.' }, { status: 500 })
     }
 
+    // Cartesia Line uses RTP/PCMU bidirectional mode — mulaw_8000 native format.
+    // Native pipeline (ElevenLabs, Deepgram TTS) uses MP3 mode.
+    const isCartesiaLine = agent.pipeline_type === 'cartesia_line'
+    const bidirectionalMode  = isCartesiaLine ? 'rtp'  : 'mp3'
+    const bidirectionalCodec = isCartesiaLine ? 'PCMU' : undefined
+
+    console.log(`[API/calls] Placing Telnyx call — lead: ${lead.phone_number} | pipeline: ${agent.pipeline_type} | bidirectional: ${bidirectionalMode}${bidirectionalCodec ? '/' + bidirectionalCodec : ''}`)
+
     // Initiate Telnyx outbound call
+    const telnyxPayload: Record<string, unknown> = {
+      connection_id:             telnyxConnectionId,
+      to:                        lead.phone_number,
+      from:                      phoneNumber.number,
+      client_state:              Buffer.from(JSON.stringify({ callId: callRecord.id })).toString('base64'),
+      // Webhook goes to ws-server (same ngrok tunnel as WebSocket)
+      webhook_url:               `${wsPublicUrl}/api/webhook/telnyx`,
+      webhook_url_method:        'POST',
+      // WSS URL must be publicly reachable by Telnyx — use ngrok public URL
+      stream_url:                `${wsPublicUrl.replace('https://', 'wss://')}/audio`,
+      stream_track:              'inbound_track',
+      // Cartesia Line: RTP+PCMU (mulaw_8000 native, no transcoding)
+      // Native pipeline: MP3 (TTS providers return MP3)
+      stream_bidirectional_mode: bidirectionalMode,
+      ...(bidirectionalCodec ? { stream_bidirectional_codec: bidirectionalCodec } : {}),
+    }
+
     const telnyxRes = await fetch('https://api.telnyx.com/v2/calls', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${telnyxApiKey}`,
       },
-      body: JSON.stringify({
-        connection_id: telnyxConnectionId,
-        to: lead.phone_number,
-        from: phoneNumber.number,
-        client_state: Buffer.from(JSON.stringify({ callId: callRecord.id })).toString('base64'),
-        // Webhook goes to ws-server (same ngrok tunnel as WebSocket)
-        webhook_url: `${wsPublicUrl}/api/webhook/telnyx`,
-        webhook_url_method: 'POST',
-        // WSS URL must be publicly reachable by Telnyx — use ngrok public URL
-        stream_url: `${wsPublicUrl.replace('https://', 'wss://')}/audio`,
-        stream_track: 'inbound_track',
-        // Required for sending TTS audio back to caller via WebSocket
-        stream_bidirectional_mode: 'mp3',
-      }),
+      body: JSON.stringify(telnyxPayload),
     })
 
     if (!telnyxRes.ok) {
       const err = await telnyxRes.text()
+      console.error(`[API/calls] Telnyx call placement failed — status: ${telnyxRes.status} | lead: ${lead.phone_number} | error: ${err}`)
       await supabase.from('calls').update({ status: 'failed' }).eq('id', callRecord.id)
       return NextResponse.json({ error: `Telnyx: ${err}` }, { status: 500 })
     }
 
     const telnyxData = await telnyxRes.json()
     const callControlId = telnyxData.data.call_control_id
+    console.log(`[API/calls] Telnyx call placed — callControlId: ${callControlId} | callId: ${callRecord.id}`)
 
-    await supabase.from('calls').update({ telephony_call_id: callControlId }).eq('id', callRecord.id)
+    const { error: updateErr } = await supabase.from('calls').update({ telephony_call_id: callControlId }).eq('id', callRecord.id)
+    if (updateErr) {
+      console.error(`[API/calls] Supabase failed to save callControlId — ${updateErr.message}`)
+    }
 
     // Register session with WebSocket server BEFORE the call is answered
     const session: CallSession = {
@@ -181,11 +208,19 @@ export async function POST(req: NextRequest) {
       maxDuration: agent.max_call_duration_seconds, callControlId,
     }
 
-    await fetch(`${wsServerUrl}/session/register`, {
+    console.log(`[API/calls] Registering session with ws-server — ${wsServerUrl}/session/register | pipeline: ${agent.pipeline_type}`)
+    const registerRes = await fetch(`${wsServerUrl}/session/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(session),
     })
+    if (!registerRes.ok) {
+      const regErr = await registerRes.text()
+      console.error(`[API/calls] ws-server session registration failed — status: ${registerRes.status} | error: ${regErr}`)
+      // Non-fatal: Telnyx call is already placed. Log and continue.
+    } else {
+      console.log(`[API/calls] Session registered successfully — callId: ${callRecord.id}`)
+    }
 
     return NextResponse.json({ success: true, callId: callRecord.id })
 
