@@ -32,7 +32,14 @@ export interface PlatformSettings {
 
 export async function loadSettings(): Promise<PlatformSettings> {
   const { data, error } = await supabase.from('settings').select('key, value')
-  if (error) throw new Error(`Failed to load platform settings: ${error.message}`)
+  if (error) {
+    // Distinguish network failures from Supabase auth/query errors
+    const isNetworkError = error.message?.includes('fetch failed') || error.message?.includes('ECONNREFUSED') || error.message?.includes('ETIMEDOUT')
+    if (isNetworkError) {
+      throw new Error(`Supabase unreachable (network error) — check SUPABASE_URL env var and Cloud Run egress: ${error.message}`)
+    }
+    throw new Error(`Supabase settings query failed: ${error.message}`)
+  }
 
   const map: Record<string, string> = {}
   for (const row of data || []) map[row.key] = row.value
